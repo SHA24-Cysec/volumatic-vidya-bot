@@ -1,0 +1,18 @@
+# Lingkungan
+.venv/
+__pycache__/
+*.py[cod]
+.uv-cache/
+.env
+# Data lokal
+var/
+*.db
+*.db-journal
+KILL_SWITCH
+# Hasil analisis
+.research/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/

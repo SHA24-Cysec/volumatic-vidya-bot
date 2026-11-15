@@ -1,0 +1,325 @@
+# =============================================================================
+# Konfigurasi bot Volumatic VIDYA (USDT-M Futures)
+# -----------------------------------------------------------------------------
+# API key TIDAK boleh ditulis di file ini. Kunci hanya dibaca dari environment
+# variable (lihat .env.example):
+#   BINANCE_API_KEY
+#   BINANCE_API_SECRET
+#   TELEGRAM_BOT_TOKEN   (opsional)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# PROFIL — pilihan setelan, tetap dalam SATU file
+# -----------------------------------------------------------------------------
+# Bawaan: profil_aktif: ""  ->  semua nilai di bawah dipakai apa adanya (aman).
+# Cara pakai profil "modal-kecil" (7-50 USDT):
+#   a) ubah baris ini menjadi   profil_aktif: "modal-kecil"   (permanen), atau
+#   b) sekali jalan tanpa mengedit apa pun:
+#          volumatic-bot --profil modal-kecil check-config
+#          volumatic-bot --profil modal-kecil run
+# Nilai di bagian `profil.<nama>` MENIMPA nilai biasa saat config dimuat; nilai
+# yang tidak disebut tetap memakai isi file ini. Lihat: volumatic-bot profil
+# Dokumentasi + angka terukurnya: docs/modal-kecil.md
+# -----------------------------------------------------------------------------
+profil_aktif: ""
+
+profil:
+  # Modal kecil 7-50 USDT. "All in 100%" TIDAK ada di sini: plafon kerasnya 25%
+  # risiko per trade, dan itu sudah ekstrem (docs/modal-kecil.md §2).
+  modal-kecil:
+    exchange:
+      default_leverage: 10          # batas keras yang diizinkan; likuidasi ~9,6%
+      max_leverage: 10              # wajib naik bersama default_leverage
+    risk:
+      risk_per_trade_pct: 5.0       # 4-5 realistis; >10 hampir selalu gagal pagar margin
+      allow_aggressive_risk: true   # WAJIB: tanpa ini config ditolak saat dimuat
+      max_concurrent_positions: 1   # modal kecil: satu posisi saja
+      max_total_margin_pct: 80.0    # sisakan 20% untuk fee & funding
+      max_per_symbol_margin_pct: 100.0
+      min_equity_usdt: 5.0          # di bawah 5 USDT tidak bisa menahan SL
+      daily_loss_limit_pct: 10.0    # 10% dari 7 USDT = 0,70 USDT
+      max_trades_per_day: 8         # biaya taker jadi dominan bila terlalu sering
+    scanner:
+      max_min_notional_usdt: 5.0    # BTC(50)/ETH(20) otomatis tersaring
+
+  # Modal sangat kecil 1-10 USDT (mis. hanya punya 5 USDT, minimum Binance).
+  # Beda utama dengan modal-kecil: risiko lebih kecil (3%) dan LANTAI equity
+  # diturunkan ke 2 USDT. Tanpa itu, satu kerugian 0,25 USDT pada equity 5
+  # langsung membuat bot berhenti membuka posisi (equity 4,75 < 5).
+  # Matematikanya: minNotional 5 USDT + SL sempit (~0,6%) => risiko minimum
+  # ~0,05 USDT, jadi secara mekanis equity ~1,6 USDT pun masih bisa trading.
+  modal-5usdt:
+    exchange:
+      default_leverage: 10
+      max_leverage: 10
+    risk:
+      risk_per_trade_pct: 3.0       # 0,15 USDT per trade pada equity 5
+      allow_aggressive_risk: true
+      max_concurrent_positions: 1
+      max_total_margin_pct: 80.0
+      max_per_symbol_margin_pct: 100.0
+      min_equity_usdt: 2.0          # berhenti di 2 USDT, bukan 5
+      daily_loss_limit_pct: 6.0     # 6% x 5 USDT = 0,30 USDT; 2 loss beruntun
+      max_trades_per_day: 4         # fee taker ~11% dari R bila terlalu sering
+      consecutive_loss_limit: 2
+    scanner:
+      max_min_notional_usdt: 5.0
+
+app:
+  name: "volumatic-vidya-bot"
+  timezone: "Asia/Jakarta"          # hanya untuk tampilan dashboard/log harian
+  log_level: "INFO"                 # DEBUG | INFO | WARNING | ERROR
+
+# -----------------------------------------------------------------------------
+# Mode operasi
+#   backtest -> data historis, tanpa order
+#   dry_run  -> sinyal nyata, tanpa order  (DEFAULT, paling aman)
+#   testnet  -> order ke Binance Futures Testnet
+#   live     -> order nyata; butuh allow_live: true DAN live_confirmation
+# -----------------------------------------------------------------------------
+ops:
+  mode: "testnet"
+  allow_live: false
+  # KOSONG dengan sengaja. Untuk mengaktifkan mode live Anda harus mengetik
+  # sendiri string berikut (tanpa tanda kutip):
+  #     live_confirmation: "SAYA-MENGERTI-RISIKONYA"
+  live_confirmation: ""
+  kill_switch_file: "KILL_SWITCH"   # jika file ini ada -> tutup semua & hentikan
+  kill_switch_poll_sec: 3           # diperiksa tiap 3 detik saat bot berjalan
+  reconcile_interval_sec: 300       # rekonsiliasi REST berkala (jarang!)
+  user_stream_keepalive_sec: 1800   # listenKey keepalive (batas Binance 60 menit)
+
+exchange:
+  market: "usdm"                    # USDT-M Futures
+  testnet: true
+  position_mode: "one-way"          # only one-way didukung pada versi ini
+  margin_mode: "isolated"           # isolated wajib untuk modal kecil
+  default_leverage: 5
+  max_leverage: 8                   # batas keras 10; >10 ditolak config
+  recv_window_ms: 5000
+  time_sync_interval_min: 30
+  request_timeout_sec: 10
+  max_retries: 4
+  # Pembatasan berat request (weight per menit) agar tidak kena ban.
+  weight_budget_per_min: 1800
+  # Endpoint order kondisional (SL/TP). Sejak 2025-12-09 Binance memindahkan
+  # STOP_MARKET / TAKE_PROFIT_MARKET / TRAILING_STOP_MARKET ke Algo Order API
+  # (POST /fapi/v1/algoOrder) dan menjawab -4120 bila dikirim ke /fapi/v1/order.
+  #   auto   = coba algo dulu, jatuh ke endpoint lama bila ditolak  (disarankan)
+  #   algo   = hanya algo (paling ketat)
+  #   legacy = hanya endpoint lama (untuk bursa/uji yang belum migrasi)
+  conditional_order_api: "auto"
+
+# -----------------------------------------------------------------------------
+# Jaringan (TAHAP 2)
+# Base URL kosong = otomatis:
+#   live    : https://fapi.binance.com   / wss://fstream.binance.com
+#   testnet : https://demo-fapi.binance.com / wss://fstream.binancefuture.com
+# Dokumentasi Binance 2026 menyebut REST testnet di demo-fapi.binance.com
+# (dokumen lama: testnet.binancefuture.com).
+# Diuji 14 November 2026 dari berbagai jaringan: demo-fapi.binance.com menjawab
+# HTTP 451/403 ("restricted location" / "IP tidak di-whitelist"), sedangkan
+# testnet.binancefuture.com menjawab 200. Karena itu bawaan di sini = host legacy.
+# Bila `volumatic-bot netcheck` gagal, perintah itu akan mencoba host alternatif
+# dan memberi tahu nilai yang harus dipakai di baris ini.
+# -----------------------------------------------------------------------------
+net:
+  rest_base_url: ""
+  ws_base_url: ""
+  legacy_testnet_rest: true         # true = testnet.binancefuture.com (terbukti hidup)
+  ws_idle_timeout_sec: 120        # kline stream kirim update tiap 250 ms
+  ws_rotate_hours: 23             # Binance memutus koneksi pada 24 jam
+  ws_max_streams: 200
+  rest_concurrency: 4             # permintaan kline paralel saat warm-up
+  kline_pace_sec: 0.05            # jeda kecil antar halaman kline
+
+# -----------------------------------------------------------------------------
+# Indikator (port Volumatic VIDYA)
+# -----------------------------------------------------------------------------
+indicator:
+  vidya_length: 10
+  vidya_momentum: 20
+  band_distance: 2.0
+  atr_length: 200
+  sma_smooth: 15
+  pivot_left: 3
+  pivot_right: 3
+  source: "close"                   # close | hl2 | ohlc4
+  # Skrip asli: pivot low pakai close, pivot high pakai high.
+  # Set keduanya ke "low"/"high" atau "close"/"close" untuk menyeragamkan.
+  pivot_low_source: "close"
+  pivot_high_source: "high"
+  zone_lookback_bars: 50
+  volume_filter: true
+  # rolling | since_flip. "since_flip" adalah nilai apa adanya dari spesifikasi,
+  # tapi pada bar entry nilainya selalu +-200/0 (baru 1 candle) sehingga tidak
+  # informatif. Default "rolling" memakai jendela volume_delta_window bar.
+  volume_filter_source: "rolling"
+  volume_delta_window: 20
+  volume_delta_min_pct: 0.0
+
+# -----------------------------------------------------------------------------
+# Pemindaian multi-simbol
+# -----------------------------------------------------------------------------
+scanner:
+  timeframe: "15m"
+  max_symbols: 30                   # batas simbol aktif (hemat bandwidth)
+  symbol_refresh_hours: 4           # `run` memindai ulang simbol tiap 4 jam (mode otomatis)
+  min_quote_volume_24h_usdt: 50000000
+  max_spread_pct: 0.05              # 0.05%
+  min_atr_pct: 0.25                 # hindari simbol terlalu mati
+  max_atr_pct: 6.0                  # hindari simbol terlalu liar
+  min_price: 0.00001
+  quote_asset: "USDT"
+  contract_type: "PERPETUAL"
+  # whitelist kosong + `run` tanpa --symbols  ->  mode OTOMATIS: bot memindai
+  # simbol aktif sendiri lalu menyegarkannya tiap symbol_refresh_hours.
+  # whitelist/--symbols diisi  ->  mode MANUAL: hanya simbol itu (paling terprediksi).
+  whitelist: []
+  blacklist: ["BTCUSDT"]            # contoh: simbol yang tidak diinginkan
+  exclude_if_min_notional_exceeds_margin: true
+  # Tolak simbol yang minimum order-nya (minNotional) lebih besar dari angka ini.
+  # Ini penyaring paling berguna untuk modal kecil: minNotional BTCUSDT 50 USDT
+  # dan ETHUSDT 20 USDT membuat satu SL 2% langsung memakan 14% / 5,7% equity.
+  # 0 = nonaktif. Preset modal kecil memakai 5.0 (lihat docs/modal-kecil.md).
+  max_min_notional_usdt: 0.0
+  # Candle warm-up saat start. Studi empiris (docs/studi-warmup.md):
+  # 250-400 bar -> tren bisa beda; 500 -> tren sama & VIDYA <2e-5; 1500 -> ATR <0.1%;
+  # 2000 -> konvergen penuh (<0.01%). Default 1500 = akurasi tinggi, biaya REST kecil.
+  warmup_bars: 1500
+  kline_rest_limit: 1500            # maksimal per request Binance
+
+# -----------------------------------------------------------------------------
+# Filter order book (hanya untuk simbol kandidat sinyal)
+# -----------------------------------------------------------------------------
+orderbook:
+  enabled: true
+  # rest   -> satu snapshot GET /fapi/v1/depth per sinyal (paling hemat, default)
+  # stream -> berlangganan <symbol>@depth<levels>@<speed>ms hanya untuk kandidat
+  source: "rest"
+  depth_limit: 20                 # limit REST valid: 5, 10, 20, 50, 100, 500, 1000
+  stream_levels: 20               # stream parsial: 5, 10, atau 20
+  stream_speed_ms: 100            # 100, 250, atau 500 ms
+  imbalance_range_pct: 0.3          # hitung imbalance dalam 0.3% dari mid
+  wall_multiplier: 8.0              # level > 8x median -> dianggap wall
+  wall_proximity_atr: 1.0           # wall di depan entry dalam <1 ATR -> tolak
+  max_spread_pct: 0.05
+  max_slippage_pct: 0.08            # estimasi slippage order bot
+  min_score_to_enter: 0.0
+  depth_snapshot_ttl_sec: 3.0       # snapshot dianggap basi setelah 3 detik
+  reject_if_unavailable: true       # gagal ambil depth -> tolak entry (fail-closed)
+  # Ukuran order untuk estimasi slippage; TAHAP 4 memberi angka sebenarnya.
+  target_notional_usdt: 20.0
+
+# -----------------------------------------------------------------------------
+# Skor gabungan saat beberapa simbol memberi sinyal bersamaan
+# -----------------------------------------------------------------------------
+scoring:
+  weight_trend: 0.4                 # |CMO| sebagai ukuran kekuatan tren
+  weight_volume: 0.3                # delta volume searah trade
+  weight_book: 0.3                  # skor order book
+  trend_cmo_ref: 50.0               # |CMO| 50 dianggap tren sangat kuat (skor 1.0)
+
+# -----------------------------------------------------------------------------
+# Risiko (ramah modal < 50 USD)
+# -----------------------------------------------------------------------------
+risk:
+  risk_per_trade_pct: 1.5           # 1%..2% disarankan; batas keras 25 (butuh saklar)
+  max_concurrent_positions: 2
+  max_total_margin_pct: 60.0        # maksimum margin terpakai dari equity
+  max_per_symbol_margin_pct: 30.0   # batas konsentrasi margin satu simbol
+  # Saklar "modal kecil / fleksibel" (lihat docs/modal-kecil.md). Bawaan false:
+  # selama false, setelan di atas 2% risiko / 60% margin-simbol / 80% margin total
+  # / equity minimum < 20 USDT akan DITOLAK saat config dimuat. "All in 100%"
+  # tetap tidak didukung; plafon kerasnya 25% risiko per trade.
+  allow_aggressive_risk: false
+  daily_loss_limit_pct: 3.0         # stop buka posisi baru setelah -3%
+  daily_loss_reset_hour_local: 0
+  consecutive_loss_limit: 3         # setelah 3 loss beruntun -> cooldown
+  cooldown_minutes: 120
+  max_trades_per_day: 20
+  # Jangan pernah membuka posisi bila jarak likuidasi lebih dekat dari ini.
+  min_liq_distance_pct: 1.0
+  # Batas kenaikan qty saat pembulatan stepSize (0.02 = maksimal 2%).
+  max_qty_round_up_pct: 2.0
+  # Tolak trade bila pembulatan membuat risiko > 2x batas.
+  max_risk_overshoot_factor: 2.0
+  min_equity_usdt: 20.0             # di bawah ini bot menolak jalan
+  small_capital_usdt: 50.0          # di bawah ini -> peringatan "modal kecil"
+  maintenance_margin_rate: 0.004    # asumsi MMR untuk perkiraan harga likuidasi
+  close_all_on_daily_limit: true    # batas rugi harian kena -> tutup semua (TAHAP 5)
+
+# -----------------------------------------------------------------------------
+# Manajemen trade: entry, SL, TP, break-even, trailing
+# -----------------------------------------------------------------------------
+trade:
+  entry_mode: "limit_fallback"      # market | limit_fallback
+  entry_limit_timeout_sec: 5        # batalkan bila tidak terisi
+  entry_limit_offset_ticks: 0       # 0 = pas best bid/ask
+  # Pilihan SL awal: "atr" | "vidya_trail" | "nearest"
+  sl_mode: "nearest"
+  sl_atr_mult: 1.5
+  sl_min_atr_mult: 0.8              # SL tidak boleh lebih sempit dari 0.8 ATR
+  tp1_r: 1.5
+  partial_tp_enabled: true
+  partial_tp_pct: 50.0              # 50% posisi ditutup di TP1
+  be_trigger_r: 1.0                 # geser SL ke BE setelah 1R
+  be_buffer_pct: 0.03               # buffer kecil di atas biaya round-trip
+  trailing_mode: "bot"              # native | bot
+  trailing_activation_r: 1.0
+  trailing_callback_rate_pct: 0.5   # hanya untuk trailing native Binance
+  trailing_atr_mult: 2.0            # untuk trailing buatan bot
+  exit_on_trend_flip: true
+  funding_aware_bars: 32            # perkiraan biaya funding untuk posisi lama
+  max_fee_r: 0.5                    # tolak trade bila fee bolak-balik >= 0.5R
+
+commission:
+  use_account_commission: true      # ambil tarif aktual dari endpoint Binance
+  maker_bps: 2.0                    # fallback maker 0.02%
+  taker_bps: 5.0                    # fallback taker 0.05%
+  slippage_bps: 2.0                 # asumsi slippage tambahan (backtest & BE)
+
+# -----------------------------------------------------------------------------
+# Database
+#   db_path       : posisi, order, insiden, state harian (data MODAL)
+#   cache_db_path : cache candle (data PASAR, dipakai bersama semua mode)
+# Dengan separate_by_mode: true, berkas posisi otomatis diberi akhiran mode:
+#   dry_run  -> var/bot-dry-run.db
+#   backtest -> var/bot-backtest.db
+#   testnet  -> var/bot-testnet.db
+#   live     -> var/bot-live.db
+# Alasannya bukan kerapian: rekonsiliasi membandingkan berkas ini dengan posisi
+# di bursa, jadi posisi hasil simulasi tidak boleh ikut terbaca di mode testnet/live.
+# -----------------------------------------------------------------------------
+data:
+  cache_dir: "var/cache"
+  db_path: "var/bot.db"
+  separate_by_mode: true
+  cache_db_path: "var/cache.db"
+  parquet_cache: true
+  max_cache_symbols: 60
+
+dashboard:
+  enabled: true
+  refresh_sec: 1.5                    # detik antar-refresh; makin besar makin hemat CPU
+  max_log_lines: 12                   # ekor log di panel kejadian
+  max_signals_shown: 10               # baris kandidat yang ditampilkan
+  compact: false                      # true = satu panel ringkas
+  show_history: true                  # tampilkan posisi yang sudah tertutup
+  history_rows: 10
+
+# -----------------------------------------------------------------------------
+# Notifikasi
+#   Bawaan proyek: konsol/log saja (tanpa layanan luar, tanpa kredensial).
+#   Kanal Telegram ada di config tetapi BELUM diimplementasikan; bila
+#   dinyalakan, bot memberi peringatan dan tetap memakai konsol.
+# -----------------------------------------------------------------------------
+notify:
+  console_enabled: true
+  telegram_enabled: false
+  telegram_chat_id: ""
+  notify_on_trade: true
+  notify_on_error: true
+  min_level: "info"                   # info | success | warning | critical
+  dedupe_sec: 60                      # pesan sejenis tidak diulang sebelum jeda ini
+  max_per_minute: 30                  # pagar agar terminal tidak dibanjiri

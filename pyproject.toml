@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "volumatic-vidya-bot"
+version = "0.1.0"
+description = "Bot trading USDT-M Futures berbasis indikator Volumatic VIDYA (port Python dari Pine Script)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Pemilik proyek" }]
+keywords = ["binance", "futures", "trading", "vidya", "asyncio"]
+
+# Catatan dependensi (diverifikasi 2026-11-14 terhadap PyPI: semua punya wheel cp314,
+# tanpa perlu build dari source). Lihat docs/kompatibilitas-python.md.
+# pyarrow (untuk parquet) sengaja TIDAK dipakai: cache memakai SQLite + .npz
+# sehingga instalasi ~120 MB lebih ringan dan CI 4 versi Python jauh lebih cepat.
+dependencies = [
+    # numpy 2.4.x adalah rilis terakhir yang masih menyediakan wheel cp311 sekaligus cp314.
+    # numpy 2.5.x sudah menuntut Python >= 3.12, jadi sengaja dibatasi < 2.5 agar seragam.
+    "numpy>=2.4.6,<2.5",
+    "pandas>=2.3,<4",
+    "pydantic>=2.12,<3",
+    "pydantic-settings>=2.10,<3",
+    "python-dotenv>=1.1,<2",
+    "PyYAML>=6.0.3,<7",
+    "aiohttp>=3.13,<4",
+    "websockets>=15,<18",
+    "rich>=14,<16",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4,<10",
+    "pytest-asyncio>=1.2,<2",
+    "ruff>=0.14,<1",
+    "pip-audit>=2.9,<3",
+    "mypy>=1.18,<3",
+    "types-PyYAML>=6.0.12",
+    "pandas-stubs>=2.3",
+]
+
+[project.scripts]
+volumatic-bot = "volumatic_bot.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/volumatic_bot"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "slow: tes yang butuh data panjang / waktu lebih lama",
+    "network: tes yang membutuhkan akses jaringan",
+]
+filterwarnings = [
+    "error::DeprecationWarning:volumatic_bot.*",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "ASYNC", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]  # komentar bahasa Indonesia banyak karakter non-ASCII
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["volumatic_bot"]
+mypy_path = "src"
+strict = true
+warn_unreachable = true
