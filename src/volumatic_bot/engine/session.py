@@ -131,12 +131,13 @@ async def run_offline_session_async(
     )
 
     akhir = len(series) if limit_bars is None else min(len(series), warmup_bars + limit_bars)
+    # Metadata simbol wajib tersedia sebelum bar pertama diproses: sinyal pada
+    # bar tepat setelah warm-up butuh tickSize/stepSize untuk tiket risiko.
+    engine.set_symbol_info(info)
     for i in range(max(warmup_bars, 1), akhir):
         event = _event(series, i, info.symbol)
         if feed.handle_event is not None:
             await feed.handle_event(event)
-        # Mesin butuh metadata untuk menghitung risiko saat sinyal muncul.
-        engine.set_symbol_info(info)
         if engine.stopped:
             report.blocked += 1
             break

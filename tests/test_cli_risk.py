@@ -88,7 +88,9 @@ def write_config(tmp_path: Path, base_url: str, **overrides: Any) -> Path:
 
 # ------------------------------------------------------------------ preflight
 def test_preflight_lolos_pada_config_default(tmp_path: Path, capsys: Any) -> None:
-    cfg = write_config(tmp_path, "http://127.0.0.1:1")  # tidak dipakai (tanpa jaringan)
+    cfg = write_config(
+        tmp_path, "http://127.0.0.1:1", profil_otomatis={"aktif": False}
+    )  # tidak dipakai (tanpa jaringan)
     code = main(["--config", str(cfg), "preflight", "--equity", "40"])
     out = capsys.readouterr().out
     assert code == 0
@@ -124,10 +126,29 @@ def test_preflight_menolak_mode_live_tanpa_konfirmasi_flag(tmp_path: Path, capsy
 
 
 def test_preflight_menolak_equity_di_bawah_minimum(tmp_path: Path, capsys: Any) -> None:
-    cfg = write_config(tmp_path, "http://127.0.0.1:1")
+    cfg = write_config(tmp_path, "http://127.0.0.1:1", profil_otomatis={"aktif": False})
     code = main(["--config", str(cfg), "preflight", "--equity", "5"])
     assert code == 1
     assert "[CEK] equity" in capsys.readouterr().out
+
+
+def test_preflight_menerapkan_profil_otomatis(tmp_path: Path, capsys: Any) -> None:
+    """Equity di bawah ambang -> preflight memeriksa config dengan profil kecil."""
+    cfg = write_config(tmp_path, "http://127.0.0.1:1")
+    code = main(["--config", str(cfg), "preflight", "--equity", "40"])
+    out = capsys.readouterr().out
+    assert "modal-kecil (otomatis dari equity)" in out
+    assert "risiko per trade" in out
+    assert code == 1
+
+
+def test_preflight_profil_manual_menang_atas_otomatis(tmp_path: Path, capsys: Any) -> None:
+    cfg = write_config(tmp_path, "http://127.0.0.1:1")
+    code = main(["--profil", "modal-5usdt", "--config", str(cfg), "preflight", "--equity", "40"])
+    out = capsys.readouterr().out
+    assert "modal-5usdt" in out
+    assert "otomatis" not in out.split("profil", 1)[1].split("\n")[0]
+    assert code in (0, 1)
 
 
 # --------------------------------------------------------------------- sizing

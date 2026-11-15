@@ -78,6 +78,7 @@ class TradeExecutor:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         mode: str | None = None,
         mark_price: Callable[[str], Awaitable[float | None]] | None = None,
+        filters_of: Callable[[str], Any] | None = None,
     ) -> None:
         self.config = config
         self.broker = broker
@@ -89,6 +90,22 @@ class TradeExecutor:
         #: Sumber harga terakhir (opsional). Dipakai untuk mendeteksi SL yang
         #: sudah terlampaui sebelum order dikirim (menghindari galat -2021).
         self._mark_price = mark_price
+        #: Sumber filter simbol (tickSize/stepSize) untuk pembulatan harga SL
+        #: trailing; tanpa ini kandidat trailing tidak dibulatkan.
+        self._filters_of = filters_of
+        #: Order biasa yang ditetaskan oleh algo order saat pemicunya kena
+        #: (``o.ai`` pada ALGO_UPDATE). ``orderId`` ini berbeda dari ``algoId``
+        #: dan hanya muncul di ORDER_TRADE_UPDATE.
+        self._spawned_sl: dict[str, set[int]] = {}
+        self._spawned_tp: dict[str, set[int]] = {}
+
+    def _filters(self, symbol: str) -> Any:
+        if self._filters_of is None:
+            return None
+        try:
+            return self._filters_of(symbol)
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------ entry
     async def open_trade(self, ticket: TradeTicket, *, atr: float) -> ExecutionReport:
@@ -121,6 +138,14 @@ class TradeExecutor:
 
         terisi = entry_order.executed_qty if entry_order.executed_qty > 0 else qty
         harga_entry = entry_order.avg_price if entry_order.avg_price > 0 else plan.entry_price
+        try:
+            posisi_bursa = await self.broker.position(ticket.symbol)
+        except Exception:
+            posisi_bursa = None
+        if posisi_bursa is not None and posisi_bursa.qty != 0:
+            terisi = abs(posisi_bursa.qty)
+            if posisi_bursa.entry_price > 0:
+                harga_entry = posisi_bursa.entry_price
 
         pos = TrackedPosition(
             symbol=ticket.symbol,
@@ -196,11 +221,23 @@ class TradeExecutor:
             if terkini.filled:
                 return terkini
         await self.broker.cancel(symbol, order_id=hasil.order_id)
+        terisi = hasil.executed_qty
+        akhir: OrderResult | None = None
+        try:
+            akhir = await self.broker.status(symbol, order_id=hasil.order_id)
+            terisi = akhir.executed_qty
+            if akhir.filled:
+                return akhir
+        except KeyError:
+            akhir = None
+        sisa = qty - terisi
+        if sisa <= 0:
+            return akhir if akhir is not None else hasil
         fallback = OrderRequest(
             symbol=symbol,
             side=side,
             type="MARKET",
-            quantity=qty,
+            quantity=sisa,
             client_order_id=None,
             new_order_resp_type="RESULT",
             purpose="entry",
@@ -387,6 +424,17 @@ class TradeExecutor:
             naked=telanjang,
         )
 
+    @staticmethod
+    def _pnl_close(pos: TrackedPosition, hasil: OrderResult, qty: Decimal) -> float:
+        """PnL penutupan: pakai ``realized_pnl`` bursa bila ada, kalau tidak
+        estimasi dari harga rata-rata isi (tanpa fee)."""
+        if hasil.realized_pnl != 0:
+            return float(hasil.realized_pnl)
+        if hasil.avg_price > 0 and qty > 0:
+            arah = 1 if pos.side == "long" else -1
+            return float((hasil.avg_price - pos.entry_price) * qty * arah)
+        return 0.0
+
     async def _close_market(self, pos: TrackedPosition, *, reason: str) -> bool:
         order = OrderRequest(
             symbol=pos.symbol,
@@ -415,6 +463,8 @@ class TradeExecutor:
                     pos.state = PositionState.CLOSED
                     pos.closed_at = self.clock()
                     pos.close_reason = reason
+                    if pos.realized_usdt is None:
+                        pos.realized_usdt = 0.0
                     pos.updated_at = self.clock()
                     self.store.save_position(pos)
                     return True
@@ -428,10 +478,12 @@ class TradeExecutor:
             return False
         self._log_order(hasil)
         if hasil.executed_qty > 0 or hasil.filled:
+            pnl = self._pnl_close(pos, hasil, pos.remaining_qty)
             pos.remaining_qty = Decimal(0)
             pos.state = PositionState.CLOSED
             pos.closed_at = self.clock()
             pos.close_reason = reason
+            pos.realized_usdt = pnl
             pos.updated_at = self.clock()
             self.store.save_position(pos)
             self.log(f"[TUTUP] {pos.symbol} {reason} @ {hasil.avg_price}")
@@ -446,6 +498,8 @@ class TradeExecutor:
             pos.state = PositionState.CLOSED
             pos.closed_at = self.clock()
             pos.close_reason = reason
+            if pos.realized_usdt is None:
+                pos.realized_usdt = self._pnl_close(pos, hasil, pos.remaining_qty)
             pos.updated_at = self.clock()
             self.store.save_position(pos)
             self.log(
@@ -478,13 +532,49 @@ class TradeExecutor:
     async def on_order_update(self, update: Any) -> None:
         """Tangani ``ORDER_TRADE_UPDATE`` dari User Data Stream."""
         pos = self.store.get_position(update.symbol)
-        if pos is None or not pos.active:
+        if pos is None:
             return
+        if not pos.active:
+            # Order penutupan (market close/kill switch) bisa tiba SETELAH posisi
+            # ditutup lokal; tanpa cabang ini PnL-nya tidak pernah tercatat.
+            if (
+                pos.closed_at is not None
+                and pos.realized_usdt is None
+                and update.is_trade
+                and update.realized_pnl != 0
+                and (update.reduce_only or update.close_position)
+            ):
+                pos.realized_usdt = float(update.realized_pnl)
+                pos.updated_at = self.clock()
+                self.store.save_position(pos)
+            return
+        keluar = side_for_exit(pos.side)
+        cocok_sl = update.order_id == pos.sl_order_id or update.order_id in self._spawned_sl.get(
+            update.symbol, set()
+        )
+        cocok_tp = update.order_id == pos.tp_order_id or update.order_id in self._spawned_tp.get(
+            update.symbol, set()
+        )
+        if (
+            not cocok_sl
+            and not cocok_tp
+            and update.order_id != pos.entry_order_id
+            and update.is_trade
+            and update.side == keluar
+        ):
+            # Order yang ditetaskan algo order saat pemicunya kena membawa
+            # ``orderId`` baru, jadi kecocokan ID bisa terlewat. Untuk order
+            # pengurang posisi di sisi keluar, jenis order dipakai sebagai
+            # pencocokan cadangan.
+            if update.order_type == "STOP_MARKET":
+                cocok_sl = True
+            elif update.order_type == "TAKE_PROFIT_MARKET":
+                cocok_tp = True
         self.store.log_order(
             symbol=update.symbol,
             side=update.side,
             type=update.order_type,
-            purpose=self._purpose_of(pos, update.order_id),
+            purpose=self._purpose_of_spawned(pos, update.order_id),
             status=update.status,
             mode=self.mode,
             order_id=update.order_id,
@@ -499,6 +589,7 @@ class TradeExecutor:
             pos.state = PositionState.CLOSED
             pos.closed_at = self.clock()
             pos.close_reason = "liquidated"
+            pos.realized_usdt = float(update.realized_pnl)
             pos.updated_at = self.clock()
             self.store.save_position(pos)
             self.store.add_incident(
@@ -510,7 +601,7 @@ class TradeExecutor:
             return
 
         # SL terkena → posisi selesai.
-        if update.order_id == pos.sl_order_id and update.filled:
+        if cocok_sl and update.filled:
             pos.state = PositionState.CLOSED
             pos.remaining_qty = Decimal(0)
             pos.closed_at = self.clock()
@@ -522,17 +613,17 @@ class TradeExecutor:
             return
 
         # TP parsial terisi → geser SL ke break-even.
-        if update.is_trade and update.filled and (pos.tp_order_id == update.order_id):
+        if update.is_trade and update.filled and cocok_tp:
             if not pos.partial_done and update.orig_qty < pos.qty:
                 pos.partial_done = True
-                pos.remaining_qty = max(Decimal(0), pos.qty - update.orig_qty)
+                pos.remaining_qty = max(Decimal(0), pos.qty - update.filled_qty)
                 pos.state = PositionState.PARTIAL
                 pos.updated_at = self.clock()
                 self.store.save_position(pos)
-                self.log(f"[TP1] {pos.symbol} sebagian ditutup {update.orig_qty}")
+                self.log(f"[TP1] {pos.symbol} sebagian ditutup {update.filled_qty}")
                 await self.move_to_break_even(pos)
                 return
-            if update.orig_qty >= pos.remaining_qty:
+            if update.filled_qty >= pos.remaining_qty:
                 pos.state = PositionState.CLOSED
                 pos.remaining_qty = Decimal(0)
                 pos.closed_at = self.clock()
@@ -541,6 +632,36 @@ class TradeExecutor:
                 pos.updated_at = self.clock()
                 self.store.save_position(pos)
                 self.log(f"[TP] {pos.symbol} take profit kena @ {update.avg_price}")
+
+    async def on_algo_update(self, update: Any) -> None:
+        """Tangani ``ALGO_UPDATE`` dari User Data Stream (order kondisional)."""
+        pos = self.store.get_position(update.symbol)
+        if pos is None or not pos.active:
+            return
+        if update.algo_id == pos.sl_order_id:
+            if update.spawned_order_id:
+                self._spawned_sl.setdefault(update.symbol, set()).add(update.spawned_order_id)
+            if update.rejection_reason:
+                alasan = (
+                    f"pemicu SL {pos.symbol} ditolak bursa ({update.rejection_reason}); "
+                    "memasang ulang SL"
+                )
+                self.store.add_incident(
+                    kind="sl_trigger_rejected",
+                    detail=alasan,
+                    severity="critical",
+                    symbol=pos.symbol,
+                )
+                self.log(f"[DARURAT] {pos.symbol}: {alasan}")
+                sl_baru, galat = await self._pasang_sl(pos, qty=pos.remaining_qty)
+                if sl_baru is None:
+                    await self._fail_protection(pos, galat, [])
+                else:
+                    pos.sl_order_id = sl_baru.order_id
+                    pos.updated_at = self.clock()
+                    self.store.save_position(pos)
+        elif update.algo_id == pos.tp_order_id and update.spawned_order_id:
+            self._spawned_tp.setdefault(update.symbol, set()).add(update.spawned_order_id)
 
     @staticmethod
     def _purpose_of(pos: TrackedPosition, order_id: int) -> str:
@@ -552,34 +673,85 @@ class TradeExecutor:
             return "entry"
         return "unknown"
 
+    def _purpose_of_spawned(self, pos: TrackedPosition, order_id: int) -> str:
+        if order_id in self._spawned_sl.get(pos.symbol, set()):
+            return "stop_loss"
+        if order_id in self._spawned_tp.get(pos.symbol, set()):
+            return "take_profit"
+        return self._purpose_of(pos, order_id)
+
     # ------------------------------------------------------------------- BE
+    async def _replace_sl(self, pos: TrackedPosition, kandidat: Decimal) -> bool:
+        """Ganti SL lama dengan SL di ``kandidat`` secara aman.
+
+        Urutannya sengaja dibalik dari "batalkan lalu pasang": SL baru dipasang
+        lebih dulu, dan SL lama hanya dibatalkan setelah SL baru diterima bursa.
+        Bila pemasangan SL baru gagal (mis. -2021 karena harga sudah lewat),
+        SL lama tetap aktif sehingga posisi tidak pernah telanjang.
+
+        Mengembalikan True bila SL baru aktif dan SL lama sudah tidak berlaku.
+        """
+        harga = kandidat
+        filters = self._filters(pos.symbol)
+        if filters is not None and filters.tick_size > 0:
+            harga = filters.round_price(harga, mode="down" if pos.side == "long" else "up")
+        if harga <= 0:
+            return False
+        if pos.side == "long" and harga <= pos.stop_price:
+            return False
+        if pos.side == "short" and harga >= pos.stop_price:
+            return False
+        sl_baru: OrderResult | None = None
+        galat: list[str] = []
+        for nomor, varian in enumerate(
+            build_stop_loss_variants(
+                symbol=pos.symbol,
+                direction=pos.side,
+                qty=pos.remaining_qty,
+                stop_price=harga,
+            ),
+            start=1,
+        ):
+            try:
+                sl_baru = await self.broker.place(varian)
+                if nomor > 1:
+                    self.store.add_incident(
+                        kind="sl_fallback",
+                        detail=(
+                            f"SL pengganti terpasang memakai varian {nomor} ({varian.describe()})"
+                        ),
+                        severity="warning",
+                        symbol=pos.symbol,
+                    )
+                break
+            except Exception as exc:
+                galat.append(f"varian {nomor}: {self._rincian_galat(exc, varian)}")
+                sl_baru = None
+        if sl_baru is None or not (sl_baru.active or sl_baru.filled):
+            self.store.add_incident(
+                kind="sl_replace_failed",
+                detail=(
+                    f"gagal memasang SL pengganti di {harga}; SL lama "
+                    f"{pos.stop_price} tetap aktif. {' || '.join(galat)}"
+                ),
+                severity="warning",
+                symbol=pos.symbol,
+            )
+            return False
+        self._log_order(sl_baru)
+        await self._cancel_protection_sl(pos)
+        pos.stop_price = harga
+        pos.sl_order_id = sl_baru.order_id
+        pos.updated_at = self.clock()
+        self.store.save_position(pos)
+        return True
+
     async def move_to_break_even(self, pos: TrackedPosition) -> bool:
         """Ganti SL dengan harga BE (sudah termasuk fee+slippage) — reduce-only."""
         if pos.be_price is None:
             return False
-        await self._cancel_protection_sl(pos)
-        order = OrderRequest(
-            symbol=pos.symbol,
-            side=side_for_exit(pos.side),
-            type="STOP_MARKET",
-            stop_price=pos.be_price,
-            close_position=True,
-            working_type="CONTRACT_PRICE",
-            purpose="stop_loss",
-        )
-        try:
-            hasil = await self.broker.place(order)
-        except Exception as exc:
-            self.store.add_incident(
-                kind="be_failed",
-                detail=f"gagal memasang SL break-even: {type(exc).__name__}: {exc}",
-                severity="critical",
-                symbol=pos.symbol,
-            )
+        if not await self._replace_sl(pos, Decimal(str(pos.be_price))):
             return False
-        self._log_order(hasil)
-        pos.stop_price = Decimal(str(pos.be_price))
-        pos.sl_order_id = hasil.order_id
         pos.be_done = True
         pos.updated_at = self.clock()
         self.store.save_position(pos)
@@ -605,41 +777,13 @@ class TradeExecutor:
             if harga < activation_price:
                 return False
             kandidat = harga - Decimal(str(atr * self.config.trade.trailing_atr_mult))
-            if kandidat <= pos.stop_price:
-                return False
         else:
             if harga > activation_price:
                 return False
             kandidat = harga + Decimal(str(atr * self.config.trade.trailing_atr_mult))
-            if kandidat >= pos.stop_price:
-                return False
-
-        await self._cancel_protection_sl(pos)
-        order = OrderRequest(
-            symbol=pos.symbol,
-            side=side_for_exit(pos.side),
-            type="STOP_MARKET",
-            stop_price=kandidat,
-            close_position=True,
-            working_type="CONTRACT_PRICE",
-            purpose="stop_loss",
-        )
-        try:
-            hasil = await self.broker.place(order)
-        except Exception as exc:
-            self.store.add_incident(
-                kind="trailing_failed",
-                detail=f"gagal menggeser trailing: {type(exc).__name__}: {exc}",
-                severity="critical",
-                symbol=pos.symbol,
-            )
+        if not await self._replace_sl(pos, kandidat):
             return False
-        self._log_order(hasil)
-        pos.stop_price = kandidat
-        pos.sl_order_id = hasil.order_id
-        pos.updated_at = self.clock()
-        self.store.save_position(pos)
-        self.log(f"[TRAIL] {pos.symbol} SL → {kandidat}")
+        self.log(f"[TRAIL] {pos.symbol} SL → {pos.stop_price}")
         return True
 
     # ------------------------------------------------------------------ util

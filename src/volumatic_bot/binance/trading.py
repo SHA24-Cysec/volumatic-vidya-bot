@@ -14,7 +14,8 @@ Rujukan dokumentasi (snapshot arsip Wayback; SPA tidak bisa dibuka langsung):
   ``/fapi/v1/order``, ``/fapi/v1/openOrders`` (bobot 1 bila memakai ``symbol``).
 * **Algo Order API** (WAJIB sejak 2025-12-09 untuk order kondisional):
   ``POST /fapi/v1/algoOrder`` (bobot 0), ``DELETE /fapi/v1/algoOrder``
-  (bobot 1, cukup ``algoid``/``clientalgoid``), ``GET /fapi/v1/openAlgoOrders``
+  (bobot 1, cukup ``algoId``/``clientAlgoId``), ``GET /fapi/v1/algoOrder``
+  (bobot 1), ``GET /fapi/v1/openAlgoOrders``
   (bobot 1 dengan ``symbol``, 40 tanpa), ``DELETE /fapi/v1/algoOpenOrders``
   (bobot 1). Snapshot dokumentasi resmi: 2025-12-09 (New Algo Order, Cancel Algo
   Order, Current All Algo Open Orders, Cancel All Algo Open Orders). Sejak
@@ -39,6 +40,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal
 
+from volumatic_bot.binance.errors import BinanceAPIError
 from volumatic_bot.binance.rest import BinanceREST
 
 __all__ = [
@@ -175,7 +177,7 @@ class OrderRequest:
         if self.callback_rate is not None:
             params["callbackRate"] = _fmt(self.callback_rate)
         if self.activation_price is not None:
-            params["activationPrice"] = _fmt(self.activation_price)
+            params["activatePrice"] = _fmt(self.activation_price)
         if self.client_order_id:
             params["clientAlgoId"] = self.client_order_id
         return params
@@ -394,17 +396,32 @@ class TradingAPI:
         Sejak 2025-12-09 Binance menolak ``STOP_MARKET``/``TAKE_PROFIT_MARKET``
         di ``/fapi/v1/order`` dengan **-4120**. Karena itu order kondisional
         selalu dicoba ke ``/fapi/v1/algoOrder`` lebih dulu (kecuali config
-        memaksa ``legacy``), dan pada mode ``auto`` kegagalannya jatuh ke
-        endpoint lama — supaya tetap jalan di bursa/uji yang belum migrasi.
+        memaksa ``legacy``). Pada mode ``auto``, endpoint lama hanya dipakai
+        bila endpoint algo memang tidak tersedia; bila keduanya gagal, error
+        asli dari endpoint algo yang dilempar supaya penyebab sebenarnya
+        (mis. -2021 harga sudah terlampaui) tidak tertutup -4120.
         """
         if order.is_conditional and self.conditional_api in ("auto", "algo"):
+            algo_error: Exception | None = None
             try:
                 payload = await self._place_algo(order)
                 return parse_order_result(payload, purpose=order.purpose)
-            except Exception:
+            except Exception as exc:
                 if self.conditional_api == "algo":
                     raise
-                # auto: endpoint lama sebagai cadangan terakhir
+                algo_error = exc
+            try:
+                payload = await self._place_legacy(order)
+                return parse_order_result(payload, purpose=order.purpose)
+            except Exception as exc:
+                # Endpoint algo tidak ada sama sekali (404) berarti bursa memang
+                # belum migrasi; error dari endpoint lama lebih informatif.
+                # Selain itu, error asli dari endpoint algo yang dipertahankan
+                # supaya -2021/-1111 tidak tertutup -4120.
+                if isinstance(algo_error, BinanceAPIError) and algo_error.status == 404:
+                    raise
+                assert algo_error is not None
+                raise algo_error from exc
         payload = await self._place_legacy(order)
         return parse_order_result(payload, purpose=order.purpose)
 
@@ -431,20 +448,46 @@ class TradingAPI:
     ) -> dict[str, Any]:
         """Batalkan satu algo order (``DELETE /fapi/v1/algoOrder``).
 
-        Dokumentasi hanya mewajibkan salah satu dari ``algoid`` atau
-        ``clientalgoid`` — ``symbol`` tidak termasuk parameter endpoint ini.
+        Nama parameter wajib camelCase persis: ``algoId`` / ``clientAlgoId``
+        (dokumentasi resmi 2025-12-09; huruf kecil ditolak -1102). ``symbol``
+        bukan parameter endpoint ini.
         """
         if algo_id is None and client_algo_id is None:
             raise ValueError("butuh algo_id atau client_algo_id")
         params: dict[str, Any] = {}
         if algo_id is not None:
-            params["algoid"] = algo_id
+            params["algoId"] = algo_id
         if client_algo_id is not None:
-            params["clientalgoid"] = client_algo_id
+            params["clientAlgoId"] = client_algo_id
         hasil: dict[str, Any] = await self.rest.request(
             "DELETE", "/fapi/v1/algoOrder", params=params, signed=True, weight=1
         )
         return hasil
+
+    async def query_algo_order(
+        self,
+        *,
+        algo_id: int | None = None,
+        client_algo_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Cari satu algo order (``GET /fapi/v1/algoOrder``; bobot 1).
+
+        Wajib salah satu dari ``algoId`` / ``clientAlgoId``. Dipakai untuk
+        membedakan algo order dari order biasa sebelum membatalkan.
+        """
+        if algo_id is None and client_algo_id is None:
+            raise ValueError("butuh algo_id atau client_algo_id")
+        params: dict[str, Any] = {}
+        if algo_id is not None:
+            params["algoId"] = algo_id
+        if client_algo_id is not None:
+            params["clientAlgoId"] = client_algo_id
+        payload = await self.rest.request(
+            "GET", "/fapi/v1/algoOrder", params=params, signed=True, weight=1
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("respons query algo order bukan objek JSON")
+        return payload
 
     async def open_algo_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """Daftar algo order aktif (``GET /fapi/v1/openAlgoOrders``).

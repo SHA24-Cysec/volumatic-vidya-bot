@@ -20,6 +20,11 @@
 # Nilai di bagian `profil.<nama>` MENIMPA nilai biasa saat config dimuat; nilai
 # yang tidak disebut tetap memakai isi file ini. Lihat: volumatic-bot profil
 # Dokumentasi + angka terukurnya: docs/modal-kecil.md
+#
+# Selain manual, ada deteksi OTOMATIS berdasarkan saldo (bagian profil_otomatis
+# di bawah): saldo < 10 USDT -> modal-5usdt, 10 s.d. <50 -> modal-kecil, >= 50
+# -> tanpa profil. Deteksi berjalan sekali saat sesi dimulai dan kalah dari
+# pilihan manual di atas.
 # -----------------------------------------------------------------------------
 profil_aktif: ""
 
@@ -64,6 +69,22 @@ profil:
       consecutive_loss_limit: 2
     scanner:
       max_min_notional_usdt: 5.0
+
+# Deteksi profil otomatis berdasarkan saldo SAAT SESI DIMULAI (dibaca sekali;
+# tidak berganti di tengah sesi walau saldo berubah). Pilihan manual selalu
+# menang: `--profil <nama>` di CLI atau `profil_aktif:` di file ini.
+#   saldo < 10 USDT  -> profil "modal-5usdt"
+#   10 s.d. <50 USDT -> profil "modal-kecil"
+#   >= 50 USDT       -> nilai dasar config (tanpa profil)
+# Berlaku untuk `run` (testnet/live; saldo dibaca dari akun) dan
+# `preflight --equity`. Matikan dengan aktif: false.
+profil_otomatis:
+  aktif: true
+  ambang_sangat_kecil_usdt: 10
+  ambang_kecil_usdt: 50
+  profil_sangat_kecil: "modal-5usdt"
+  profil_kecil: "modal-kecil"
+  profil_default: ""
 
 app:
   name: "volumatic-vidya-bot"
@@ -305,6 +326,7 @@ dashboard:
   max_log_lines: 12                   # ekor log di panel kejadian
   max_signals_shown: 10               # baris kandidat yang ditampilkan
   compact: false                      # true = satu panel ringkas
+  layar_penuh: true                   # layar penuh saat live: kebal resize, frame tak menumpuk
   show_history: true                  # tampilkan posisi yang sudah tertutup
   history_rows: 10
 

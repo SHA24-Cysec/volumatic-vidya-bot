@@ -60,6 +60,12 @@ def _qty_decimal(value: Any) -> Decimal:
     return Decimal(str(value))
 
 
+def _now_ms() -> int:
+    import time
+
+    return int(time.time() * 1000)
+
+
 async def reconcile(
     *,
     broker: Broker,
@@ -97,6 +103,8 @@ async def reconcile(
             pos.state = PositionState.CLOSED
             pos.remaining_qty = Decimal(0)
             pos.close_reason = "hilang_di_bursa"
+            pos.closed_at = pos.closed_at if pos.closed_at is not None else _now_ms()
+            pos.updated_at = _now_ms()
             store.save_position(pos)
             detail = "posisi tidak ada lagi di bursa (SL/TP kemungkinan sudah tereksekusi)"
             store.add_incident(
@@ -135,7 +143,17 @@ async def reconcile(
                 kind="side_mismatch", detail=detail, severity="critical", symbol=symbol
             )
             report.actions.append(ReconcileAction("side_mismatch", symbol, detail, "critical"))
-            await _close_unknown(broker, store, symbol, bursa.qty, bursa.side or "long", mode)
+            aksi = await _close_unknown(
+                broker, store, symbol, bursa.qty, bursa.side or "long", mode
+            )
+            report.actions.append(aksi)
+            if aksi.severity != "critical":
+                pos.state = PositionState.FAILED
+                pos.remaining_qty = Decimal(0)
+                pos.close_reason = "side_mismatch"
+                pos.closed_at = _now_ms()
+                pos.updated_at = _now_ms()
+                store.save_position(pos)
             continue
 
         # 4) SL wajib ada
@@ -236,13 +254,14 @@ async def _close_unknown(
         type="MARKET",
         quantity=abs(Decimal(str(qty))),
         reduce_only=True,
+        new_order_resp_type="RESULT",
         purpose="close",
     )
     try:
         hasil = await broker.place(order)
-        ok = hasil.executed_qty > 0
+        ok = hasil.executed_qty > 0 or hasil.filled
         detail = (
-            f"posisi {'ditolak' if ok else 'TIDAK'} ditutup market ({hasil.status})"
+            f"posisi ditutup market ({hasil.status}, terisi {hasil.executed_qty})"
             if ok
             else f"gagal menutup posisi ({hasil.status})"
         )

@@ -67,6 +67,7 @@ class DepthStreamClient(CombinedStreamClient):
             send_gap_sec=send_gap_sec,
             connect_factory=connect_factory,
             max_streams=max_streams,
+            channel="public",
         )
         self.levels = levels
         self.speed_ms = speed_ms

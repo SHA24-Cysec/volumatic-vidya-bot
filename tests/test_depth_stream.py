@@ -74,6 +74,11 @@ def test_speed_tidak_valid_ditolak(speed: int) -> None:
 def test_url_klien_depth() -> None:
     client = DepthStreamClient(["BTCUSDT", "ETHUSDT"], levels=10, speed_ms=250)
     assert client.url == (
+        "wss://fstream.binancefuture.com/public/stream?streams="
+        "btcusdt@depth10@250ms/ethusdt@depth10@250ms"
+    )
+    client._legacy_fallback = True
+    assert client.url == (
         "wss://fstream.binancefuture.com/stream?streams=btcusdt@depth10@250ms/ethusdt@depth10@250ms"
     )
 

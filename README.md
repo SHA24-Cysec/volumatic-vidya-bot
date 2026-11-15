@@ -434,7 +434,7 @@ docs/          laporan teknis tiap tahap + docs/modal-kecil.md (modal <50 USDT)
 ## Menjalankan test
 
 ```bash
-pytest -q                      # semua test (656 test, ~45–85 detik tergantung mesin)
+pytest -q                      # semua test (695 test, ~45–85 detik tergantung mesin)
 pytest -q -m "not slow"        # lewati studi konvergensi (lebih cepat)
 ruff check src tests && ruff format --check src tests
 mypy src                       # mode strict

@@ -6,7 +6,11 @@ trading yang memanggil dashboard tidak ikut gagal.
 
 Mode pakai:
 
-* ``DashboardApp.run()`` — layar penuh (``rich.live.Live``) selama bot berjalan;
+* ``DashboardApp.run()`` — tampilan dinamis (``rich.live.Live``) selama bot
+  berjalan. Bawaan memakai alternate screen (layar penuh): frame tidak pernah
+  menumpuk di scrollback walau terminal di-resize atau dipindah, dan saat
+  berhenti layar kembali ke isi sebelum bot start. Terminal non-interaktif
+  (pipe, CI, berkas log) otomatis jatuh ke mode inline.
 * ``DashboardApp.render_once()`` — cetak sekali lalu keluar, untuk terminal yang
   tidak mendukung tampilan dinamis, cron, atau log berkas.
 """
@@ -41,6 +45,7 @@ class DashboardApp:
         console: Console | None = None,
         refresh_sec: float = 1.5,
         compact: bool = False,
+        screen: bool = True,
     ) -> None:
         if refresh_sec <= 0:
             raise ValueError("refresh_sec harus > 0")
@@ -48,6 +53,7 @@ class DashboardApp:
         self._console = console or Console()
         self._refresh = refresh_sec
         self._compact = compact
+        self._screen = screen
         self.frames = 0
         self.errors = 0
 
@@ -97,7 +103,7 @@ class DashboardApp:
                 self.renderable(self.take()),
                 console=self._console,
                 refresh_per_second=max(1, int(1 / self._refresh)),
-                screen=False,
+                screen=self._screen and self._console.is_terminal,
                 transient=False,
             ) as live:
                 frames = 1

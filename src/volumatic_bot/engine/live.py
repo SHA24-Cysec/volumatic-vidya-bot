@@ -38,7 +38,14 @@ from volumatic_bot.binance.symbols import ExchangeInfo, parse_exchange_info
 from volumatic_bot.binance.trading import TradingAPI
 from volumatic_bot.binance.user_stream import ListenKeyManager, UserDataStream
 from volumatic_bot.binance.ws import KlineStreamClient
-from volumatic_bot.config import AppConfig, Secrets
+from volumatic_bot.config import (
+    AppConfig,
+    Secrets,
+    baca_yaml,
+    deteksi_profil_otomatis,
+    load_config,
+    profil_aktif_dari,
+)
 from volumatic_bot.dashboard.app import DashboardApp
 from volumatic_bot.dashboard.sources import LocalStateSource
 from volumatic_bot.data.cache import KlineCache
@@ -153,9 +160,21 @@ def _saring_simbol(simbol: list[str], config: AppConfig, exchange_info: Exchange
 
 
 async def build_session(
-    config: AppConfig, secrets: Secrets, *, symbols: list[str] | None = None
+    config: AppConfig,
+    secrets: Secrets,
+    *,
+    symbols: list[str] | None = None,
+    config_path: str | Path | None = None,
+    profil: str | None = None,
+    saldo_awal: float | None = None,
 ) -> LiveSession:
-    """Susun semua komponen sesi dari konfigurasi (tanpa membuka koneksi WS)."""
+    """Susun semua komponen sesi dari konfigurasi (tanpa membuka koneksi WS).
+
+    ``config_path`` + ``profil`` dipakai deteksi profil otomatis: bila saldo
+    akun berada di bawah ambang dan tidak ada pilihan profil manual, sesi
+    disusun ulang dari config dengan profil modal kecil. Keputusan diambil
+    sekali di awal; tidak pernah berganti di tengah sesi.
+    """
     if config.ops.mode not in ("testnet", "live"):
         raise ValueError("build_session hanya untuk mode testnet/live")
     if config.ops.mode == "live" and not config.ops.allow_live:
@@ -199,7 +218,41 @@ async def build_session(
 
         # --- state harian (dipulihkan dari SQLite) ---------------------------
         zona = _now_zona(config)
-        saldo = await api.balance_usdt()
+        saldo = saldo_awal if saldo_awal is not None else await api.balance_usdt()
+
+        # --- deteksi profil otomatis (sekali, di awal sesi) ------------------
+        # Pilihan manual (--profil / profil_aktif) selalu menang. Bila deteksi
+        # memilih profil, seluruh sesi disusun ulang dari config final supaya
+        # tidak ada komponen yang memakai setengah profil lama setengah baru.
+        if config_path is not None:
+            nama_otomatis = deteksi_profil_otomatis(
+                config, config_path, profil_cli=profil, saldo=saldo
+            )
+            if nama_otomatis is not None:
+                config_baru = load_config(config_path, profil=nama_otomatis)
+                logger.warning(
+                    "PROFIL OTOMATIS: saldo %.2f USDT -> profil '%s' diterapkan "
+                    "(leverage %sx, risiko %.1f%%/trade, maks %s posisi, lantai "
+                    "equity %.2f USDT). Profil dipilih SEKALI di awal sesi; "
+                    "pilihan manual (--profil / profil_aktif) selalu menang; "
+                    "matikan lewat profil_otomatis.aktif: false.",
+                    saldo,
+                    nama_otomatis,
+                    config_baru.exchange.default_leverage,
+                    config_baru.risk.risk_per_trade_pct,
+                    config_baru.risk.max_concurrent_positions,
+                    config_baru.risk.min_equity_usdt,
+                )
+                await rest.close()
+                db.close()
+                return await build_session(
+                    config_baru,
+                    secrets,
+                    symbols=symbols,
+                    config_path=config_path,
+                    profil=nama_otomatis,
+                    saldo_awal=saldo,
+                )
         limits = DailyLimits(
             daily_loss_limit_pct=config.risk.daily_loss_limit_pct,
             max_trades_per_day=config.risk.max_trades_per_day,
@@ -261,6 +314,13 @@ async def build_session(
                 )
         daftar = _saring_simbol(diminta, config, exchange_info)
 
+        # --- siapkan akun: position mode, leverage, margin -------------------
+        # RiskManager menghitung ukuran posisi dengan asumsi leverage
+        # ``exchange.default_leverage`` dan margin ISOLATED satu arah (one-way).
+        # Tanpa langkah ini, akun yang masih hedge-mode/20x/CROSSED akan trading
+        # dengan parameter yang salah atau ditolak bursa (galat positionSide).
+        await _siapkan_akun(api, daftar, config)
+
         # --- order book + gate ----------------------------------------------
         depth = RestDepthSource(rest, limit=config.orderbook.depth_limit, ttl_sec=3.0)
         gate = SignalGate(config, depth, exchange_info.get, clock=time.time)
@@ -275,6 +335,10 @@ async def build_session(
             nilai = peta.get(symbol)
             return float(nilai) if nilai is not None else None
 
+        def _filters_of(symbol: str) -> Any:
+            item = exchange_info.symbols.get(symbol.upper())
+            return item.filters if item is not None else None
+
         executor = TradeExecutor(
             config,
             broker,
@@ -283,6 +347,7 @@ async def build_session(
             logger=logger.info,
             mode=config.ops.mode,
             mark_price=_harga_mark,
+            filters_of=_filters_of,
         )
 
         # --- feed sinyal -----------------------------------------------------
@@ -324,6 +389,10 @@ async def build_session(
 
         feed._on_signal = _on_signal
 
+        nama_profil = profil or ""
+        if not nama_profil and config_path is not None:
+            with contextlib.suppress(Exception):
+                nama_profil = profil_aktif_dari(baca_yaml(config_path))
         return LiveSession(
             config=config,
             db=db,
@@ -336,7 +405,13 @@ async def build_session(
             engine=engine,
             dashboard=dashboard,
             exchange_info=exchange_info,
-            info={"harian": harian, "depth": depth, "saldo_awal": saldo, "symbols": daftar},
+            info={
+                "harian": harian,
+                "depth": depth,
+                "saldo_awal": saldo,
+                "symbols": daftar,
+                "profil": nama_profil,
+            },
             auto=auto,
             scanner=pemindai,
             cache=singgahan,
@@ -352,6 +427,35 @@ async def build_session(
         with contextlib.suppress(Exception):
             db.close()
         raise
+
+
+async def _siapkan_akun(api: TradingAPI, symbols: list[str], config: AppConfig) -> None:
+    """Samakan setelan akun bursa dengan asumsi perhitungan risiko bot.
+
+    Tiga hal yang wajib sama: mode posisi satu arah, leverage
+    ``exchange.default_leverage``, dan margin ISOLATED. Kode -4046 (margin sudah
+    sesuai) dan -4059 (mode posisi sudah sesuai) bukan kegagalan. Kegagalan
+    lain tidak menghentikan sesi, tapi dicatat supaya operator tahu ukuran
+    margin/likuidasi bisa menyimpang dari hitungan bot.
+    """
+    try:
+        await api.set_position_mode(dual_side=False)
+    except Exception as exc:
+        if getattr(exc, "code", None) != -4059:
+            logger.warning("gagal set position mode one-way: %s", exc)
+    leverage = config.exchange.default_leverage
+    for symbol in symbols:
+        try:
+            await api.set_leverage(symbol, leverage)
+        except Exception as exc:
+            logger.warning("gagal set leverage %sx untuk %s: %s", leverage, symbol, exc)
+        try:
+            await api.set_margin_type(symbol, config.exchange.margin_mode.upper())
+        except Exception as exc:
+            if getattr(exc, "code", None) != -4046:
+                logger.warning(
+                    "gagal set margin %s untuk %s: %s", config.exchange.margin_mode, symbol, exc
+                )
 
 
 async def _warmup(
@@ -404,12 +508,16 @@ async def run_live_session(
     symbols: list[str] | None = None,
     iterations: int | None = None,
     dashboard: bool = True,
+    config_path: str | Path | None = None,
+    profil: str | None = None,
 ) -> int:
     """Jalankan sesi sampai dihentikan (Ctrl+C / kill switch / batas harian).
 
     Mengembalikan kode keluar: 0 normal, 2 bila sesi diblokir sebelum mulai.
     """
-    sesi = await build_session(config, secrets, symbols=symbols)
+    sesi = await build_session(
+        config, secrets, symbols=symbols, config_path=config_path, profil=profil
+    )
     # Catat PID: supaya `volumatic-bot stop` bisa menemukan proses ini, dan supaya
     # tidak ada dua bot yang jalan bersamaan pada database/mode yang sama.
     jalur_pid = Path(config.pid_file())
@@ -429,6 +537,7 @@ async def run_live_session(
         testnet=config.exchange.testnet,
         metrics=sesi.metrics,
         on_order=engine.handle_order_update,
+        on_algo=engine.handle_algo_update,
     )
 
     def _buat_klien_kline(simbol: list[str]) -> KlineStreamClient:
@@ -460,7 +569,11 @@ async def run_live_session(
         assert state is not None
         return state
 
-    app = DashboardApp(_state, refresh_sec=config.dashboard.refresh_sec)
+    app = DashboardApp(
+        _state,
+        refresh_sec=config.dashboard.refresh_sec,
+        screen=config.dashboard.layar_penuh,
+    )
     tugas = [
         asyncio.create_task(user_stream.run(), name="user-stream"),
         asyncio.create_task(kline_stream.run(), name="kline-stream"),
@@ -590,5 +703,7 @@ async def _tick_harga(sesi: LiveSession) -> None:
         terbaru = harga.get(pos.symbol)
         if terbaru is None:
             continue
-        sesi.engine.set_atr(pos.symbol, abs(float(terbaru) - float(pos.entry_price)) * 0.5)
+        atr = sesi.feed.last_atr.get(pos.symbol)
+        if atr is not None and atr > 0:
+            sesi.engine.set_atr(pos.symbol, atr)
         await sesi.engine.handle_price(pos.symbol, float(terbaru))

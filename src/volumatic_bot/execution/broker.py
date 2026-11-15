@@ -93,11 +93,22 @@ class LiveBroker:
         order_id: int | None = None,
         client_order_id: str | None = None,
     ) -> OrderResult:
-        payload = await self.api.query_order(
-            symbol, order_id=order_id, client_order_id=client_order_id
-        )
+        """Cari status order: endpoint biasa dulu, lalu algo bila tidak ada.
+
+        Sejak 2025-12-09 SL/TP hidup di Algo Order API, jadi ``order_id`` yang
+        disimpan pemanggil bisa berupa ``algoId`` yang tidak dikenal
+        ``GET /fapi/v1/order`` (-2013).
+        """
         from volumatic_bot.binance.trading import parse_order_result
 
+        try:
+            payload = await self.api.query_order(
+                symbol, order_id=order_id, client_order_id=client_order_id
+            )
+            return parse_order_result(payload)
+        except Exception:
+            pass
+        payload = await self.api.query_algo_order(algo_id=order_id, client_algo_id=client_order_id)
         return parse_order_result(payload)
 
     async def cancel(
@@ -107,21 +118,21 @@ class LiveBroker:
         order_id: int | None = None,
         client_order_id: str | None = None,
     ) -> bool:
-        """Batalkan order — order biasa dan algo order dicoba dua-duanya.
+        """Batalkan order — algo order dicoba lebih dulu, lalu order biasa.
 
-        Sejak Algo Order API dipisah (2025-12-09), SL/TP hidup di
-        ``/fapi/v1/algoOrder`` dan TIDAK terlihat oleh ``DELETE /fapi/v1/order``.
-        Karena pemanggil hanya menyimpan ``order_id`` (algoId untuk order algo),
-        di sini dicoba endpoint biasa dulu lalu endpoint algo; keduanya murah
-        (bobot 1) dan kegagalan salah satunya normal.
+        Urutan ini penting untuk keselamatan: ``DELETE /fapi/v1/algoOrder``
+        tidak pernah menyentuh order biasa, jadi mencobanya lebih dulu tidak
+        bisa salah sasaran. Sebaliknya, memanggil ``DELETE /fapi/v1/order``
+        dengan ``orderId`` yang sebenarnya adalah ``algoId`` berisiko
+        membatalkan order biasa lain yang kebetulan memiliki ID sama.
         """
         try:
-            await self.api.cancel_order(symbol, order_id=order_id, client_order_id=client_order_id)
+            await self.api.cancel_algo_order(algo_id=order_id, client_algo_id=client_order_id)
             return True
         except Exception:
             pass
         try:
-            await self.api.cancel_algo_order(algo_id=order_id, client_algo_id=client_order_id)
+            await self.api.cancel_order(symbol, order_id=order_id, client_order_id=client_order_id)
             return True
         except Exception:
             # Order mungkin sudah terisi/berakhir; itu bukan kegagalan fatal.

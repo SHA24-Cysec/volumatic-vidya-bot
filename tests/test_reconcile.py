@@ -123,6 +123,8 @@ async def test_posisi_hilang_di_bursa_ditutup_di_catatan(store: PositionStore) -
     assert pos is not None
     assert pos.state is PositionState.CLOSED
     assert pos.close_reason == "hilang_di_bursa"
+    assert pos.closed_at is not None
+    assert pos.updated_at >= pos.opened_at
     assert any(a.kind == "position_missing" for a in laporan.actions)
     assert any(a.kind == "cancel_orphan_order" for a in laporan.actions)
 
@@ -134,6 +136,12 @@ async def test_arah_tidak_cocok_posisi_ditutup(store: PositionStore) -> None:
     laporan = await reconcile(broker=broker, store=store)
     assert any(a.kind == "side_mismatch" for a in laporan.actions)
     assert any(i.kind == "side_mismatch" for i in store.incidents())
+    pos = store.get_position("DOGEUSDT")
+    assert pos is not None
+    assert pos.state is PositionState.FAILED
+    assert pos.close_reason == "side_mismatch"
+    assert pos.closed_at is not None
+    assert await broker.position("DOGEUSDT") is None
 
 
 @pytest.mark.asyncio

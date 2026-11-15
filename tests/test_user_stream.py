@@ -256,7 +256,7 @@ async def test_stream_menerima_order_dan_account(user_ws_server: Any) -> None:
 
     assert peristiwa and peristiwa[0].symbol == "DOGEUSDT"
     assert akun and akun[0].balances["USDT"] == Decimal("50.12")
-    assert state["paths"][0] == "/ws/kunci-1"
+    assert state["paths"][0] == "/private/ws/kunci-1"
     assert state["connections"] >= 2, "klien tidak menyambung ulang setelah diputus"
     assert stream.reconnects >= 1
 

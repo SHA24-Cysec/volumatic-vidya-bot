@@ -56,6 +56,7 @@ from volumatic_bot.config import (
     Secrets,
     baca_yaml,
     daftar_profil,
+    deteksi_profil_otomatis,
     load_config,
     mask_secret,
     profil_aktif_dari,
@@ -92,6 +93,15 @@ def _cmd_profil(args: argparse.Namespace) -> int:
     aktif = profil_aktif_dari(raw, getattr(args, "profil", None))
     print(f"config   : {args.config}")
     print(f"profil aktif: {aktif or '(tidak ada — memakai nilai biasa)'}")
+    otomatis = raw.get("profil_otomatis")
+    if isinstance(otomatis, dict) and otomatis.get("aktif"):
+        print(
+            f"otomatis : AKTIF (saldo < {otomatis.get('ambang_sangat_kecil_usdt')} -> "
+            f"{otomatis.get('profil_sangat_kecil')}, < {otomatis.get('ambang_kecil_usdt')} -> "
+            f"{otomatis.get('profil_kecil')}; dipilih sekali saat sesi mulai)"
+        )
+    else:
+        print("otomatis : nonaktif")
     if not tersedia:
         print("tidak ada bagian `profil:` di config ini.")
         return 0
@@ -436,6 +446,7 @@ def _cmd_simulate_trade(args: argparse.Namespace) -> int:
                 clock=lambda: int(_time.time() * 1000),
                 logger=logger.info,
                 mode="dry_run",
+                filters_of=lambda simbol: item.filters,
             )
             laporan = await executor.open_trade(tiket, atr=atr)
             print(f"\nEksekusi: {laporan.summary()}")
@@ -728,6 +739,7 @@ def _cmd_simulate_session(args: argparse.Namespace) -> int:
             clock=lambda: int(_time.time() * 1000),
             logger=logger_info(),
             mode="dry_run",
+            filters_of=lambda simbol: info.filters,
         )
         engine = TradingEngine(
             config,
@@ -1132,6 +1144,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 symbols=args.symbols,
                 iterations=args.iterations,
                 dashboard=not args.no_dashboard,
+                config_path=args.config,
+                profil=getattr(args, "profil", None),
             )
         )
     except ValueError as exc:
@@ -1168,6 +1182,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     console = Console()
     compact = args.compact or config.dashboard.compact
     refresh = args.refresh if args.refresh is not None else config.dashboard.refresh_sec
+    screen = config.dashboard.layar_penuh and not args.inline
 
     if args.demo:
         contoh = demo_state()
@@ -1175,7 +1190,9 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
         def sumber_demo() -> Any:
             return contoh
 
-        app = DashboardApp(sumber_demo, console=console, refresh_sec=refresh, compact=compact)
+        app = DashboardApp(
+            sumber_demo, console=console, refresh_sec=refresh, compact=compact, screen=screen
+        )
         if args.iterations is not None and args.iterations > 1 and console.is_terminal:
             return 0 if asyncio.run(app.run(iterations=args.iterations)) else 1
         app.render_once()
@@ -1213,7 +1230,9 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
             source.set_logs(buffer.lines(limit=config.dashboard.max_log_lines))
             return source.snapshot()
 
-        app = DashboardApp(ambil, console=console, refresh_sec=refresh, compact=compact)
+        app = DashboardApp(
+            ambil, console=console, refresh_sec=refresh, compact=compact, screen=screen
+        )
         if not args.once and console.is_terminal:
             frames = asyncio.run(app.run(iterations=args.iterations))
             return 0 if frames else 1
@@ -1277,6 +1296,29 @@ def _cmd_preflight(args: argparse.Namespace) -> int:
     config, secrets = _load(args)
     setup_logging(config.app.log_level, secrets=secrets.secret_values())
     baris: list[tuple[str, bool, str]] = []
+
+    # Deteksi profil otomatis memakai equity yang diberikan eksplisit, supaya
+    # hasil preflight mencerminkan profil yang akan dipakai `run` nantinya.
+    profil_manual = profil_aktif_dari(baca_yaml(args.config), getattr(args, "profil", None))
+    profil_otomatis = ""
+    if args.equity is not None and not profil_manual:
+        profil_otomatis = (
+            deteksi_profil_otomatis(
+                config, args.config, profil_cli=getattr(args, "profil", None), saldo=args.equity
+            )
+            or ""
+        )
+        if profil_otomatis:
+            config = load_config(args.config, profil=profil_otomatis)
+    baris.append(
+        (
+            "profil",
+            True,
+            (profil_manual or f"{profil_otomatis} (otomatis dari equity)")
+            if (profil_manual or profil_otomatis)
+            else "(tanpa profil — nilai biasa config)",
+        )
+    )
 
     mode = config.ops.mode
     baris.append(
@@ -2165,6 +2207,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="pakai data contoh (angka karangan) untuk melihat tampilan saja",
     )
     dash.add_argument("--compact", action="store_true", help="tampilan ringkas satu panel")
+    dash.add_argument("--inline", action="store_true", help="pakai mode inline (tanpa layar penuh)")
     dash.add_argument("--refresh", type=float, default=None, help="detik antar-refresh")
     dash.add_argument("--iterations", type=int, default=None, help="batas jumlah frame")
     dash.set_defaults(func=_cmd_dashboard)

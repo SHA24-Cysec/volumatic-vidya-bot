@@ -146,6 +146,8 @@ class KlineFeed:
         # Bar tertutup terakhir yang sudah diproses per simbol: mencegah sinyal
         # ganda bila event yang sama terkirim ulang (mis. setelah reconnect).
         self._last_processed: dict[str, int] = {}
+        # ATR terakhir per simbol dari candle tertutup (dipakai trailing live).
+        self.last_atr: dict[str, float] = {}
         self.processed = 0
         self.ignored_unclosed = 0
         self.signals = 0
@@ -194,6 +196,11 @@ class KlineFeed:
         self.processed += 1
         series = buffer.to_series()
         result = await self._compute(series)
+        idx = len(result) - 1
+        if idx >= 0:
+            atr = float(result.atr[idx])
+            if atr > 0:
+                self.last_atr[symbol] = atr
         direction = entry_signal(result, -1)
         if direction is None:
             return None

@@ -31,14 +31,17 @@ __all__ = [
     "IndicatorConfig",
     "NetConfig",
     "OpsConfig",
+    "ProfilOtomatisConfig",
     "RiskConfig",
     "ScoringConfig",
     "Secrets",
     "TradeConfig",
     "baca_yaml",
     "daftar_profil",
+    "deteksi_profil_otomatis",
     "load_config",
     "mask_secret",
+    "pilih_profil_otomatis",
     "profil_aktif_dari",
     "terapkan_profil",
 ]
@@ -443,9 +446,38 @@ class DashboardConfig(_Strict):
     max_signals_shown: int = Field(default=10, ge=1, le=100)
     #: Tampilkan panel ringkas satu blok (cocok untuk layar sempit / log berkas).
     compact: bool = False
+    #: Mode layar penuh (alternate screen) untuk tampilan dinamis: kebal
+    #: duplikasi frame saat terminal di-resize; ``false`` = mode inline lama.
+    layar_penuh: bool = True
     #: Ikut menampilkan posisi yang sudah tertutup pada panel posisi.
     show_history: bool = True
     history_rows: int = Field(default=10, ge=0, le=50)
+
+
+class ProfilOtomatisConfig(_Strict):
+    """Deteksi profil berdasarkan saldo saat sesi dimulai.
+
+    Keputusan diambil SEKALI di awal sesi (bukan saat berjalan) supaya parameter
+    risiko tidak berganti di tengah posisi terbuka. Pilihan manual (``--profil``
+    di CLI atau ``profil_aktif`` di file) selalu menang atas deteksi ini.
+    """
+
+    aktif: bool = False
+    ambang_sangat_kecil_usdt: float = Field(default=10.0, gt=0)
+    ambang_kecil_usdt: float = Field(default=50.0, gt=0)
+    profil_sangat_kecil: str = "modal-5usdt"
+    profil_kecil: str = "modal-kecil"
+    #: Profil untuk modal normal; kosong berarti nilai dasar config tanpa profil.
+    profil_default: str = ""
+
+    @model_validator(mode="after")
+    def _urutan_ambang(self) -> ProfilOtomatisConfig:
+        if self.ambang_sangat_kecil_usdt > self.ambang_kecil_usdt:
+            raise ValueError(
+                "profil_otomatis.ambang_sangat_kecil_usdt tidak boleh lebih besar "
+                "dari ambang_kecil_usdt"
+            )
+        return self
 
 
 class NotifyConfig(_Strict):
@@ -487,6 +519,7 @@ class AppConfig(_Strict):
     data: DataConfig = Field(default_factory=DataConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
+    profil_otomatis: ProfilOtomatisConfig = Field(default_factory=ProfilOtomatisConfig)
 
     # ------------------------------------------------------------- database
     def mode_slug(self) -> str:
@@ -644,7 +677,8 @@ def terapkan_profil(
     if nama not in tersedia:
         pilihan = ", ".join(sorted(tersedia)) or "(tidak ada)"
         raise ConfigError(f"profil {nama!r} tidak ada di config. Pilihan: {pilihan}")
-    return _gabung_dalam(bersih, tersedia[nama]), nama
+    lapisan = {k: v for k, v in tersedia[nama].items() if k != "profil_otomatis"}
+    return _gabung_dalam(bersih, lapisan), nama
 
 
 def load_config(path: str | Path = "config.yaml", profil: str | None = None) -> AppConfig:
@@ -667,3 +701,45 @@ def load_secrets(env_file: str | Path | None = None) -> Secrets:
     if env_file is not None:
         os.environ.setdefault("_ENV_FILE_HINT", str(env_file))
     return Secrets()
+
+
+def pilih_profil_otomatis(pengaturan: ProfilOtomatisConfig, *, saldo: float) -> str | None:
+    """Nama profil hasil deteksi saldo; ``None`` bila modal normal / deteksi mati.
+
+    Pemetaan: ``saldo < ambang_sangat_kecil`` -> profil sangat kecil;
+    ``< ambang_kecil`` -> profil kecil; selain itu ``profil_default``
+    (kosong berarti tanpa profil).
+    """
+    if not pengaturan.aktif or saldo <= 0:
+        return None
+    if saldo < pengaturan.ambang_sangat_kecil_usdt:
+        nama = pengaturan.profil_sangat_kecil
+    elif saldo < pengaturan.ambang_kecil_usdt:
+        nama = pengaturan.profil_kecil
+    else:
+        nama = pengaturan.profil_default
+    return nama or None
+
+
+def deteksi_profil_otomatis(
+    config: AppConfig,
+    path: str | Path,
+    *,
+    profil_cli: str | None,
+    saldo: float,
+) -> str | None:
+    """Profil otomatis untuk ``saldo`` pada config di ``path``.
+
+    Mengembalikan ``None`` (tidak ada deteksi) bila: deteksi nonaktif, saldo
+    tidak valid, atau ada pilihan manual (``--profil`` / ``profil_aktif``).
+    Pilihan manual selalu lebih kuat supaya perilaku bot tetap prediktabel.
+    """
+    if profil_cli:
+        return None
+    try:
+        raw = baca_yaml(path)
+    except ConfigError:
+        return None
+    if profil_aktif_dari(raw):
+        return None
+    return pilih_profil_otomatis(config.profil_otomatis, saldo=saldo)

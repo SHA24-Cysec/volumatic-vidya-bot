@@ -82,6 +82,17 @@ WS_STREAM_PREFIX = {
     "testnet": "wss://fstream.binancefuture.com",
 }
 
+#: Channel WebSocket hasil pemisahan 2026-04-23 (diverifikasi probe langsung
+#: 15 Nov 2026): ``depth``/``bookTicker`` hanya hidup di ``/public``, data
+#: pasar reguler (``kline``/``markPrice``/``aggTrade``/``ticker``) di
+#: ``/market``, dan user data stream di ``/private``. Jalur lama
+#: ``/stream`` dan ``/ws`` sudah tidak menerima data di produksi.
+WS_CHANNELS = {
+    "public": "/public",
+    "market": "/market",
+    "private": "/private",
+}
+
 
 class Endpoint:
     """Base URL per lingkungan."""

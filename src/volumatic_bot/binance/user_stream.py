@@ -9,13 +9,15 @@ Aturan resmi yang dipegang (dokumentasi *User Data Streams / Connect*, 2025-01):
 
 * ``listenKey`` berlaku **60 menit**; ``PUT`` memperpanjang 60 menit; ``POST``
   mengembalikan key yang sama bila masih aktif; ``DELETE`` menutup.
-* Stream dibuka di ``/ws/<listenKey>``.
+* Stream dibuka di ``/private/ws/<listenKey>`` (jalur lama ``/ws/<listenKey>``
+  sudah dinonaktifkan produksi sejak 2026-04-23; dipakai hanya sebagai
+  cadangan bila channel private ditolak).
 * Satu koneksi hanya valid **24 jam** → klien ini berotasi sebelum itu.
 * Bila server mengirim ``listenKeyExpired``, key harus dibuat ulang dan koneksi
   disambung ulang; kita tidak berpura-pura stream masih hidup.
 
-Payload penting yang diurai: ``ORDER_TRADE_UPDATE``, ``ACCOUNT_UPDATE``,
-``MARGIN_CALL``, ``listenKeyExpired``.
+Payload penting yang diurai: ``ORDER_TRADE_UPDATE``, ``ALGO_UPDATE``,
+``ACCOUNT_UPDATE``, ``MARGIN_CALL``, ``listenKeyExpired``.
 """
 
 from __future__ import annotations
@@ -39,15 +41,18 @@ from volumatic_bot.metrics import Metrics
 
 __all__ = [
     "AccountUpdate",
+    "AlgoUpdate",
     "ListenKeyManager",
     "OrderUpdate",
     "UserDataStream",
     "parse_account_update",
+    "parse_algo_update",
     "parse_order_update",
 ]
 
 OrderHandler = Callable[["OrderUpdate"], Awaitable[None] | None]
 AccountHandler = Callable[["AccountUpdate"], Awaitable[None] | None]
+AlgoHandler = Callable[["AlgoUpdate"], Awaitable[None] | None]
 RawHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
@@ -112,6 +117,62 @@ class AccountUpdate:
     reason: str
     balances: dict[str, Decimal] = field(default_factory=dict)
     positions: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AlgoUpdate:
+    """Satu kejadian ``ALGO_UPDATE`` (order kondisional) yang sudah dinormalkan.
+
+    Sejak migrasi Algo Order API (2025-12-09), SL/TP kondisional tidak lagi
+    memakai ``orderId`` biasa. Saat pemicu tercapa, bursa menetaskan order
+    biasa baru: ``spawned_order_id`` (``o.ai``) berbeda dari ``algo_id``
+    (``o.aid``). Tanpa memantau event ini, isi SL/TP tidak akan pernah cocok
+    dengan ``orderId`` di ``ORDER_TRADE_UPDATE``.
+    """
+
+    symbol: str
+    algo_id: int
+    client_algo_id: str
+    side: str
+    order_type: str
+    status: str
+    spawned_order_id: int
+    triggered_qty: Decimal
+    avg_price: Decimal
+    rejection_reason: str
+    event_time_ms: int
+
+    @property
+    def triggered(self) -> bool:
+        return self.status in ("TRIGGERING", "TRIGGERED")
+
+    @property
+    def finished(self) -> bool:
+        return self.status == "FINISHED"
+
+    @property
+    def rejected(self) -> bool:
+        return bool(self.rejection_reason) and self.status in ("NEW", "CANCELED", "FINISHED")
+
+
+def parse_algo_update(payload: dict[str, Any]) -> AlgoUpdate:
+    """Urai event ``ALGO_UPDATE`` (field pendek sesuai dokumentasi resmi)."""
+    data = payload.get("o")
+    if not isinstance(data, dict):
+        raise ValueError("payload bukan ALGO_UPDATE (tidak ada field 'o')")
+    return AlgoUpdate(
+        symbol=str(data.get("s", "")),
+        algo_id=int(data.get("aid", 0) or 0),
+        client_algo_id=str(data.get("caid", "")),
+        side=str(data.get("S", "")),
+        order_type=str(data.get("o", "")),
+        status=str(data.get("X", "")),
+        spawned_order_id=int(data.get("ai", 0) or 0),
+        triggered_qty=_dec(data.get("aq", 0)),
+        avg_price=_dec(data.get("ap", 0)),
+        rejection_reason=str(data.get("rm", "")),
+        event_time_ms=int(payload.get("E", 0) or 0),
+    )
 
 
 def parse_order_update(payload: dict[str, Any]) -> OrderUpdate:
@@ -217,6 +278,7 @@ class UserDataStream:
         metrics: Metrics | None = None,
         on_order: OrderHandler | None = None,
         on_account: AccountHandler | None = None,
+        on_algo: AlgoHandler | None = None,
         on_raw: RawHandler | None = None,
         rotate_after_sec: float = 23 * 3600.0,
         max_backoff_sec: float = 60.0,
@@ -229,9 +291,11 @@ class UserDataStream:
         self.metrics = metrics or Metrics()
         self.on_order = on_order
         self.on_account = on_account
+        self.on_algo = on_algo
         self.on_raw = on_raw
         self.rotate_after_sec = rotate_after_sec
         self.max_backoff_sec = max_backoff_sec
+        self._legacy_fallback = False
         self._connect = connect_factory or ws_connect
         self._clock = clock
         self._jitter = jitter
@@ -244,6 +308,8 @@ class UserDataStream:
     def url(self) -> str:
         if not self.keys.key:
             raise ValueError("listenKey belum dibuat")
+        if not self._legacy_fallback:
+            return f"{self.base_url}/private/ws/{self.keys.key}"
         return f"{self.base_url}/ws/{self.keys.key}"
 
     @property
@@ -283,32 +349,43 @@ class UserDataStream:
 
     async def _run_connection(self) -> None:
         await self.keys.ensure()
+        try:
+            ws = await self._connect(self.url(), max_size=2**20, open_timeout=10)
+        except Exception as exc:
+            if not self._legacy_fallback:
+                self._legacy_fallback = True
+                raise ConnectionError(
+                    f"channel /private/ws tidak bisa dibuka ({type(exc).__name__}); "
+                    "sambungan berikutnya memakai jalur lama /ws"
+                ) from exc
+            raise
         started = self._clock()
         last_message = started
         keepalive_task: asyncio.Task[None] | None = None
         try:
-            async with self._connect(self.url(), max_size=2**20, open_timeout=10) as ws:
-                self._ws = ws
-                keepalive_task = asyncio.create_task(self._keepalive_loop())
-                while not self._stop.is_set():
-                    timeout = max(1.0, self.rotate_after_sec - (self._clock() - started))
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=min(timeout, 120.0))
-                    except TimeoutError:
-                        if self._clock() - started >= self.rotate_after_sec:
-                            return  # rotasi 24 jam: biarkan run() menyambung lagi
-                        if self._clock() - last_message > 600:
-                            return  # tidak ada kabar 10 menit: anggap mati
-                        continue
-                    last_message = self._clock()
-                    self.metrics.record_ws_message(len(raw) if isinstance(raw, bytes | str) else 0)
-                    await self._handle_raw(raw)
+            self._ws = ws
+            keepalive_task = asyncio.create_task(self._keepalive_loop())
+            while not self._stop.is_set():
+                timeout = max(1.0, self.rotate_after_sec - (self._clock() - started))
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=min(timeout, 120.0))
+                except TimeoutError:
+                    if self._clock() - started >= self.rotate_after_sec:
+                        return  # rotasi 24 jam: biarkan run() menyambung lagi
+                    if self._clock() - last_message > 600:
+                        return  # tidak ada kabar 10 menit: anggap mati
+                    continue
+                last_message = self._clock()
+                self.metrics.record_ws_message(len(raw) if isinstance(raw, bytes | str) else 0)
+                await self._handle_raw(raw)
         finally:
             self._ws = None
             if keepalive_task is not None:
                 keepalive_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await keepalive_task
+            with contextlib.suppress(Exception):
+                await ws.close()
 
     async def _keepalive_loop(self) -> None:
         while not self._stop.is_set():
@@ -347,6 +424,13 @@ class UserDataStream:
             except ValueError:
                 return
             await _maybe_await(self.on_order(update))
+            return
+        if event == "ALGO_UPDATE" and self.on_algo is not None:
+            try:
+                algo = parse_algo_update(payload)
+            except ValueError:
+                return
+            await _maybe_await(self.on_algo(algo))
             return
         if event == "ACCOUNT_UPDATE" and self.on_account is not None:
             try:

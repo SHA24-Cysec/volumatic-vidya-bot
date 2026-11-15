@@ -211,6 +211,73 @@ def test_run_berhenti_lewat_stop_event() -> None:
     assert asyncio.run(skenario()) >= 1
 
 
+# ------------------------------------------------------------ layar penuh
+def _pasang_live_palsu(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Ganti ``rich.live.Live`` dengan pemalsu perekam argumen; kembalikan rekaman."""
+    import rich.live
+
+    rekaman: dict[str, Any] = {}
+
+    class LivePalsu:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            rekaman.update(kwargs)
+
+        def __enter__(self) -> LivePalsu:
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+
+        def update(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    monkeypatch.setattr(rich.live, "Live", LivePalsu)
+    return rekaman
+
+
+def test_run_menggunakan_layar_penuh_di_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    rekaman = _pasang_live_palsu(monkeypatch)
+    console = Console(width=100, file=io.StringIO(), force_terminal=True)
+    app = DashboardApp(lambda: demo_state(), console=console, refresh_sec=0.01)
+    assert asyncio.run(app.run(iterations=2)) == 2
+    assert rekaman["screen"] is True
+
+
+def test_run_jatuh_ke_inline_bila_bukan_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pipe/CI/berkas log tidak punya alternate screen: kunci ke mode inline."""
+    rekaman = _pasang_live_palsu(monkeypatch)
+    console = Console(width=100, force_terminal=False)
+    app = DashboardApp(lambda: demo_state(), console=console, refresh_sec=0.01)
+    assert asyncio.run(app.run(iterations=2)) == 2
+    assert rekaman["screen"] is False
+
+
+def test_run_bisa_memilih_mode_inline(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    rekaman = _pasang_live_palsu(monkeypatch)
+    console = Console(width=100, file=io.StringIO(), force_terminal=True)
+    app = DashboardApp(lambda: demo_state(), console=console, refresh_sec=0.01, screen=False)
+    assert asyncio.run(app.run(iterations=2)) == 2
+    assert rekaman["screen"] is False
+
+
+def test_config_layar_penuh_default_hidup() -> None:
+    from volumatic_bot.config import AppConfig, DashboardConfig
+
+    assert AppConfig().dashboard.layar_penuh is True
+    assert DashboardConfig().layar_penuh is True
+
+
+def test_config_layar_penuh_tipe_salah_ditolak() -> None:
+    from volumatic_bot.config import DashboardConfig
+
+    with pytest.raises(Exception, match="layar_penuh"):
+        DashboardConfig(layar_penuh="bukan-boolean")  # type: ignore[arg-type]
+
+
 def test_renderable_compact() -> None:
     console = Console(width=100, force_terminal=False)
     app = DashboardApp(lambda: demo_state(), console=console, compact=True)

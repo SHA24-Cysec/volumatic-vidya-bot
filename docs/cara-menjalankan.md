@@ -5,6 +5,16 @@
 > bawah 20 USDT, dan "all in 100%" tidak didukung (plafon 25%). Ringkasnya:
 > jalankan semua perintah dengan `--profil modal-kecil` (semua setelan tetap di
 > satu `config.yaml`, tidak ada file config kedua).
+>
+> Sejak 15 Nov 2026 ada juga **deteksi profil otomatis** (bagian
+> `profil_otomatis` di config.yaml): saat `run` dimulai, saldo akun dibaca satu
+> kali lalu dipetakan — saldo < 10 USDT memakai profil `modal-5usdt`, 10 s.d.
+> <50 USDT memakai `modal-kecil`, dan >= 50 USDT memakai nilai dasar config.
+> `preflight --equity <saldo>` memakai pemetaan yang sama. Keputusan diambil
+> SEKALI di awal sesi (tidak berganti di tengah jalan walau saldo berubah), dan
+> pilihan manual (`--profil <nama>` atau `profil_aktif:`) selalu menang. Profil
+> hasil deteksi dicatat di log sebagai peringatan menonjol; matikan fiturnya
+> dengan `profil_otomatis.aktif: false`.
 
 Panduan ini urut dari yang **paling aman** ke yang **paling berisiko**. Jangan
 lompat langkah. Setiap perintah ditulis persis seperti yang sudah diuji di repo
@@ -47,7 +57,7 @@ Cek cepat bahwa semuanya sehat:
 
 ```bash
 volumatic-bot version
-pytest -q          # harus 551 passed
+pytest -q          # harus 695 passed
 ```
 
 ---
@@ -217,7 +227,12 @@ sudah gagal dengan `HTTP 403 IP tidak di-whitelist atau akses ditolak` atau
 
 Catatan: `wss://fstream.binancefuture.com` (WebSocket testnet) tetap sama untuk
 kedua host, dan sudah terbukti menerima data (uji 14 Nov 2026: 1.723 pesan dalam
-60 detik untuk 28 simbol, latensi ~52 ms).
+60 detik untuk 28 simbol, latensi ~52 ms). Sejak 2026-04-23 Binance memisahkan
+channel WebSocket: kline lewat `/market/stream`, depth lewat `/public/stream`,
+dan user data stream lewat `/private/ws/<listenKey>`; bot memakai jalur baru
+ini secara otomatis dan jatuh ke jalur lama hanya bila channel baru ditolak
+(probe langsung 15 Nov 2026: produksi hanya menerima channel baru, testnet
+menerima keduanya).
 
 ## 4c. Apa yang seharusnya Anda lihat di dashboard `run`
 
@@ -234,6 +249,16 @@ dikirim sampai ada sinyal yang lolos semua pagar. Contoh yang normal:
 | `Bandwidth 72 MB/jam` (menit pertama) | dulu melaporkan burst warm-up (1500 candle + exchangeInfo). Sekarang jendela direset setelah warm-up, jadi angkanya mencerminkan kondisi tunak |
 | `LOG TERAKHIR — belum ada log` | dulu panel ini tidak pernah terisi di `run`; sekarang bot memasang penangkap log sehingga baris terakhir muncul |
 | `Jaringan 4 req / 53 pesan WS, Latensi 53 ms` | WebSocket sungguhan bekerja |
+
+Sejak 15 Nov 2026 tampilan dinamis (`run` maupun `dashboard` tanpa `--once`)
+memakai **layar penuh** (alternate screen): frame digambar ulang dari atas layar
+pada setiap refresh sehingga tidak pernah menumpuk di scrollback walau terminal
+di-resize, dipindah, atau diperbesar, dan saat bot berhenti terminal kembali
+persis seperti sebelum bot start (log startup terlihat lagi). Matikan lewat
+`dashboard.layar_penuh: false` di config.yaml, atau `--inline` pada perintah
+`dashboard`, bila Anda ingin perilaku lama (frame terakhir tertinggal di
+scrollback). Output non-terminal (pipe, CI, berkas log) otomatis memakai mode
+inline tanpa alternate screen.
 
 ### Database sudah dipisah per mode (otomatis)
 
@@ -343,6 +368,7 @@ Sambil berjalan, pantau dari terminal lain:
 ```bash
 volumatic-bot positions                # posisi, order, insiden dari SQLite
 volumatic-bot dashboard                # 4 panel: status, posisi, kandidat, kejadian
+volumatic-bot dashboard --inline       # mode lama: frame di scrollback (bukan layar penuh)
 ```
 
 Menghentikan paksa semuanya (kill switch):
@@ -647,7 +673,7 @@ periksa sebelum mengunggah ke mana pun.
 
 ## 10. Checklist sebelum uang sungguhan
 
-- [ ] `pytest -q` → 656 passed di mesin Anda.
+- [ ] `pytest -q` → 695 passed di mesin Anda.
 - [ ] `check-config` + `preflight --equity <saldo asli>` semua `[OK ]`.
 - [ ] `netcheck` semua `[OK ]` dari mesin yang akan dipakai (VPS, bukan laptop
       di jaringan yang diblokir).

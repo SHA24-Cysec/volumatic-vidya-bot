@@ -120,9 +120,17 @@ def _client(base_url: str, **kwargs: Any) -> tuple[KlineStreamClient, list[Any],
 def test_url_stream_gabungan() -> None:
     client, _, _ = _client("wss://fstream.binance.com")
     assert client.url == (
-        "wss://fstream.binance.com/stream?streams=btcusdt@kline_15m/ethusdt@kline_15m"
+        "wss://fstream.binance.com/market/stream?streams=btcusdt@kline_15m/ethusdt@kline_15m"
     )
     assert kline_stream_name("BTCUSDT", "15m") == "btcusdt@kline_15m"
+
+
+def test_url_channel_bisa_jatuh_ke_jalur_lama() -> None:
+    client, _, _ = _client("wss://fstream.binance.com")
+    client._legacy_fallback = True
+    assert client.url == (
+        "wss://fstream.binance.com/stream?streams=btcusdt@kline_15m/ethusdt@kline_15m"
+    )
 
 
 def test_tanpa_simbol_ditolak() -> None:

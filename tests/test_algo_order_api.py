@@ -78,6 +78,18 @@ class FakeREST:
             }
         if path == "/fapi/v1/algoOrder" and method == "DELETE":
             return {"algoId": 2146760, "code": "200", "msg": "success"}
+        if path == "/fapi/v1/algoOrder" and method == "GET":
+            return {
+                "algoId": params.get("algoId") if params else 0,
+                "clientAlgoId": "vbot-sl-1",
+                "orderType": "STOP_MARKET",
+                "symbol": "DOGEUSDT",
+                "side": "SELL",
+                "quantity": "100",
+                "algoStatus": "NEW",
+                "triggerPrice": "0.3444",
+                "closePosition": True,
+            }
         if path == "/fapi/v1/algoOpenOrders":
             return {"code": 200, "msg": "done"}
         if path == "/fapi/v1/openAlgoOrders":
@@ -156,6 +168,25 @@ def test_parameter_algo_untuk_reduceonly_membawa_quantity() -> None:
     assert params["quantity"] == "100"
     assert params["reduceOnly"] == "true"
     assert "closePosition" not in params
+
+
+def test_parameter_algo_trailing_memakai_activateprice() -> None:
+    order = OrderRequest(
+        symbol="DOGEUSDT",
+        side="SELL",
+        type="TRAILING_STOP_MARKET",
+        quantity=Decimal("100"),
+        stop_price=Decimal("0.3444"),
+        callback_rate=Decimal("0.5"),
+        activation_price=Decimal("0.36"),
+        reduce_only=True,
+        purpose="stop_loss",
+    )
+    params = order.to_algo_params()
+    assert params["activatePrice"] == "0.36"
+    assert params["callbackRate"] == "0.5"
+    assert "activationPrice" not in params
+    assert params["reduceOnly"] == "true"
 
 
 # ---------------------------------------------------------------- 2) routing
@@ -256,7 +287,7 @@ async def test_cancel_algo_memakai_algoid_tanpa_symbol() -> None:
     await api.cancel_algo_order(algo_id=2146760)
     call = rest.calls[0]
     assert (call["method"], call["path"]) == ("DELETE", "/fapi/v1/algoOrder")
-    assert call["params"] == {"algoid": 2146760}  # dokumentasi: tanpa symbol
+    assert call["params"] == {"algoId": 2146760}  # camelCase; tanpa symbol
     assert call["weight"] == 1
 
 
@@ -270,6 +301,14 @@ async def test_cancel_algo_butuh_id() -> None:
 class RESTTanpaAlgo(FakeREST):
     async def request(self, method: str, path: str, **kwargs: Any) -> Any:
         if "algo" in path.lower():
+            self.calls.append(
+                {
+                    "method": method,
+                    "path": path,
+                    "params": dict(kwargs.get("params") or {}),
+                    "weight": kwargs.get("weight", 1),
+                }
+            )
             raise BinanceAPIError("not found", status=404, code=-1)
         return await super().request(method, path, **kwargs)
 
@@ -285,13 +324,71 @@ class RESTAlgoSaja(FakeREST):
 
 
 @pytest.mark.asyncio
-async def test_broker_cancel_mencoba_endpoint_lama_lalu_algo() -> None:
+async def test_broker_cancel_algo_dulu_lalu_order_biasa() -> None:
     rest = RESTAlgoSaja()
     broker = LiveBroker(TradingAPI(rest, conditional_api="auto"))  # type: ignore[arg-type]
     ok = await broker.cancel("DOGEUSDT", order_id=2146760)
     assert ok is True
+    assert [c["path"] for c in rest.calls] == ["/fapi/v1/algoOrder"]
+    assert rest.calls[0]["params"] == {"algoId": 2146760}
+
+
+@pytest.mark.asyncio
+async def test_broker_cancel_jatuh_ke_order_biasa_bila_algo_tidak_ada() -> None:
+    rest = RESTTanpaAlgo()
+    broker = LiveBroker(TradingAPI(rest, conditional_api="auto"))  # type: ignore[arg-type]
+    ok = await broker.cancel("DOGEUSDT", order_id=555)
+    assert ok is True
+    assert [c["path"] for c in rest.calls] == ["/fapi/v1/algoOrder", "/fapi/v1/order"]
+
+
+@pytest.mark.asyncio
+async def test_auto_mempertahankan_error_algo_bila_keduanya_gagal() -> None:
+    """Mode auto tidak boleh menutupi penyebab asli (mis. -2021) dengan -4120."""
+    galat_algo = BinanceAPIError("Order would immediately trigger.", status=400, code=-2021)
+    rest = FakeREST(algo_error=galat_algo)
+
+    async def tolak_legacy(method: str, path: str, **kwargs: Any) -> Any:
+        if path == "/fapi/v1/order" and method == "POST":
+            rest.calls.append({"method": method, "path": path, "params": {}, "weight": 0})
+            raise BinanceAPIError(
+                "Order type not supported for this endpoint.", status=400, code=-4120
+            )
+        return await FakeREST.request(rest, method, path, **kwargs)
+
+    rest.request = tolak_legacy  # type: ignore[method-assign]
+    api = TradingAPI(rest, conditional_api="auto")  # type: ignore[arg-type]
+    with pytest.raises(BinanceAPIError) as info:
+        await api.place_order(sl_order())
+    assert getattr(info.value, "code", None) == -2021
+
+
+@pytest.mark.asyncio
+async def test_query_algo_order_memakai_camelcase() -> None:
+    rest = FakeREST()
+    api = TradingAPI(rest, conditional_api="auto")  # type: ignore[arg-type]
+    payload = await api.query_algo_order(algo_id=2146760)
+    call = rest.calls[0]
+    assert (call["method"], call["path"]) == ("GET", "/fapi/v1/algoOrder")
+    assert call["params"] == {"algoId": 2146760}
+    assert payload["algoStatus"] == "NEW"
+
+
+@pytest.mark.asyncio
+async def test_broker_status_jatuh_ke_algo_bila_order_biasa_tidak_ada() -> None:
+    class RESTOrderHilang(FakeREST):
+        async def request(self, method: str, path: str, **kwargs: Any) -> Any:
+            if path == "/fapi/v1/order" and method == "GET":
+                self.calls.append({"method": method, "path": path, "params": {}, "weight": 1})
+                raise BinanceAPIError("Order does not exist.", status=400, code=-2013)
+            return await super().request(method, path, **kwargs)
+
+    rest = RESTOrderHilang()
+    broker = LiveBroker(TradingAPI(rest, conditional_api="auto"))  # type: ignore[arg-type]
+    hasil = await broker.status("DOGEUSDT", order_id=2146760)
     assert [c["path"] for c in rest.calls] == ["/fapi/v1/order", "/fapi/v1/algoOrder"]
-    assert rest.calls[1]["params"] == {"algoid": 2146760}
+    assert hasil.is_algo is True
+    assert hasil.active
 
 
 @pytest.mark.asyncio

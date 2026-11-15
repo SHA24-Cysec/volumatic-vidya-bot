@@ -60,6 +60,7 @@ class CombinedStreamClient:
         wall_clock: Callable[[], float] = time.time,
         jitter: Callable[[], float] = random.random,
         max_streams: int = 1024,
+        channel: str | None = None,
     ) -> None:
         self.base_url = (base_url or Endpoint.ws(testnet=testnet)).rstrip("/")
         self.metrics = metrics or Metrics()
@@ -68,6 +69,8 @@ class CombinedStreamClient:
         self.max_backoff_sec = max_backoff_sec
         self.send_gap_sec = send_gap_sec
         self.max_streams = max_streams
+        self.channel = channel
+        self._legacy_fallback = False
         self._connect = connect_factory or ws_connect
         self._clock = clock
         self._wall_clock = wall_clock
@@ -101,6 +104,8 @@ class CombinedStreamClient:
         streams = "/".join(self.stream_name(s) for s in self._symbols)
         if not streams:
             raise ValueError("tidak ada stream untuk dijahit ke URL")
+        if self.channel and not self._legacy_fallback:
+            return f"{self.base_url}/{self.channel}/stream?streams={streams}"
         return f"{self.base_url}/stream?streams={streams}"
 
     @property
@@ -165,32 +170,48 @@ class CombinedStreamClient:
 
     async def _run_connection(self) -> None:
         url = self.url
+        try:
+            ws = await self._connect(url, ping_interval=None, max_queue=256, open_timeout=10)
+        except Exception as exc:
+            if self.channel and not self._legacy_fallback:
+                self._legacy_fallback = True
+                raise ConnectionError(
+                    f"channel /{self.channel}/stream tidak bisa dibuka "
+                    f"({type(exc).__name__}); sambungan berikutnya memakai jalur lama /stream"
+                ) from exc
+            raise
+        try:
+            await self._run_session(ws)
+        finally:
+            with contextlib.suppress(Exception):
+                await ws.close()
+
+    async def _run_session(self, ws: ClientConnection) -> None:
         connected_at = self._clock()
         self._last_message_at = connected_at
-        async with self._connect(url, ping_interval=None, max_queue=256, open_timeout=10) as ws:
-            self._ws = ws
-            try:
-                await self.on_connected(ws)
-                while not self._stop.is_set():
-                    # Rotasi sebelum batas 24 jam, tanpa bergantung ada/tidaknya pesan.
-                    remaining = self.rotate_after_sec - (self._clock() - connected_at)
-                    if remaining <= 0:
+        self._ws = ws
+        try:
+            await self.on_connected(ws)
+            while not self._stop.is_set():
+                # Rotasi sebelum batas 24 jam, tanpa bergantung ada/tidaknya pesan.
+                remaining = self.rotate_after_sec - (self._clock() - connected_at)
+                if remaining <= 0:
+                    await ws.close()
+                    return
+                timeout = min(self.idle_timeout_sec, remaining)
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                except TimeoutError as exc:
+                    if self._clock() - connected_at >= self.rotate_after_sec:
                         await ws.close()
                         return
-                    timeout = min(self.idle_timeout_sec, remaining)
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                    except TimeoutError as exc:
-                        if self._clock() - connected_at >= self.rotate_after_sec:
-                            await ws.close()
-                            return
-                        raise ConnectionError(
-                            f"tidak ada pesan selama {self.idle_timeout_sec:.0f} detik"
-                        ) from exc
-                    self._last_message_at = self._clock()
-                    await self._handle_raw(raw)
-            finally:
-                self._ws = None
+                    raise ConnectionError(
+                        f"tidak ada pesan selama {self.idle_timeout_sec:.0f} detik"
+                    ) from exc
+                self._last_message_at = self._clock()
+                await self._handle_raw(raw)
+        finally:
+            self._ws = None
 
     async def on_connected(self, ws: ClientConnection) -> None:
         """Hook opsional setelah koneksi terbuka (mis. mengirim SUBSCRIBE manual)."""

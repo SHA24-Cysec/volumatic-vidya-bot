@@ -119,6 +119,8 @@ class TradingEngine:
         self._clock = clock or (lambda: int(time.time() * 1000))
         self.marks = _Marks()
         self.seen: set[tuple[str, str, int]] = set()
+        self._recorded_outcomes: set[tuple[str, int]] = set()
+        self._enforcing_limit = False
         self.stopped = False
         self.stop_reason: str | None = None
         self.counters: dict[str, int] = {
@@ -189,7 +191,14 @@ class TradingEngine:
         kunci = (signal.symbol, signal.direction, int(signal.open_time))
         if kunci in self.seen:
             return EngineResult("duplicate", signal.symbol, "sinyal yang sama sudah diproses")
+        if len(self.seen) >= 8192:
+            # Sinyal ganda hanya mungkin datang beberapa detik setelah yang asli
+            # (reconnect WebSocket), jadi membersihkan riwayat lama aman dan
+            # mencegah set ini tumbuh tanpa batas pada sesi berhari-hari.
+            self.seen.clear()
         self.seen.add(kunci)
+        if signal.atr > 0:
+            self.set_atr(signal.symbol, signal.atr)
 
         diblokir, alasan = self.is_blocked()
         if diblokir:
@@ -303,9 +312,7 @@ class TradingEngine:
                 )
         terbaru = self.store.get_position(symbol)
         if terbaru is not None and sebelum is not None and sebelum.active and not terbaru.active:
-            self.counters["closed"] += 1
-            self._notify(event_for_exit(terbaru))
-            await self._record_outcome(terbaru)
+            await self._record_outcome_once(terbaru)
         return pesan
 
     def _atr_of(self, symbol: str) -> float:
@@ -320,10 +327,11 @@ class TradingEngine:
         cache[symbol.upper()] = atr
 
     def _activation_of(self, pos: Any) -> Decimal:
-        """Harga aktivasi trailing: 1R searah trade (sama dengan rencana awal)."""
+        """Harga aktivasi trailing sesuai ``trade.trailing_activation_r``."""
         entry = Decimal(str(pos.entry_price))
         risiko = Decimal(str(pos.risk_per_unit))
-        return entry + risiko if pos.side == "long" else entry - risiko
+        r = Decimal(str(self.config.trade.trailing_activation_r))
+        return entry + risiko * r if pos.side == "long" else entry - risiko * r
 
     # --------------------------------------------------------------- order
     async def handle_order_update(self, update: Any) -> None:
@@ -333,10 +341,13 @@ class TradingEngine:
         if pos is None:
             return
         if not pos.active:
-            self.counters["closed"] += 1
-            self._notify(event_for_exit(pos))
-            await self._record_outcome(pos)
-        elif update.status == "FILLED" and getattr(update, "reduce_only", False):
+            await self._record_outcome_once(pos)
+        elif (
+            update.status == "FILLED"
+            and getattr(update, "reduce_only", False)
+            and getattr(update, "is_trade", False)
+            and update.filled_qty < update.orig_qty
+        ):
             self._notify(
                 NotifyEvent(
                     kind=NotifyKind.PARTIAL_TP,
@@ -347,17 +358,42 @@ class TradingEngine:
                 )
             )
 
+    async def handle_algo_update(self, update: Any) -> None:
+        """Teruskan event ``ALGO_UPDATE`` (order kondisional) ke eksekutor."""
+        await self.executor.on_algo_update(update)
+
+    async def _record_outcome_once(self, pos: Any) -> None:
+        """Catat hasil trade tepat satu kali per posisi (kunci: simbol+waktu buka).
+
+        Tanpa kunci ini, event order yang datang setelah posisi tertutup
+        (mis. pembatalan TP setelah SL kena) akan mencatat hasil yang sama dua
+        kali — PnL, jumlah trade hari ini, dan rugi beruntun ikut dobel.
+        """
+        kunci = (pos.symbol, int(pos.opened_at))
+        if kunci in self._recorded_outcomes:
+            return
+        if pos.realized_usdt is None:
+            return
+        self._recorded_outcomes.add(kunci)
+        self.counters["closed"] += 1
+        self._notify(event_for_exit(pos))
+        await self._record_outcome(pos)
+
     async def _record_outcome(self, pos: Any) -> None:
         """Catat hasil trade ke batas harian, lalu tegakkan batas rugi harian."""
         from volumatic_bot.risk.limits import TradeOutcome
 
         if pos.realized_usdt is None:
             return
+        now = self.risk.now()
+        if now.tzinfo is None:
+            from zoneinfo import ZoneInfo
+
+            now = now.replace(tzinfo=ZoneInfo(self.config.app.timezone))
         pnl = float(pos.realized_usdt)
-        self.risk.daily.current_equity += pnl
         self.risk.daily.record(
-            TradeOutcome(symbol=pos.symbol, pnl_usdt=pnl, closed_at=self.risk.now()),
-            self.risk.now(),
+            TradeOutcome(symbol=pos.symbol, pnl_usdt=pnl, closed_at=now),
+            now,
         )
         await self.enforce_daily_limit()
 
@@ -381,12 +417,18 @@ class TradingEngine:
             f"{len(aktif)} posisi lalu menghentikan sesi",
         )
         logger.warning("KILL SWITCH: menutup %s posisi lalu berhenti", len(aktif))
+        ditutup: list[str] = []
         for pos in aktif:
             ok = await self.executor.close_position(pos.symbol, reason="kill_switch")
             if ok:
                 self.counters["closed"] += 1
+                ditutup.append(pos.symbol)
             else:
                 logger.error("kill switch: gagal menutup %s — tutup manual di bursa", pos.symbol)
+        for symbol in ditutup:
+            pos_tutup = self.store.get_position(symbol)
+            if pos_tutup is not None:
+                await self._record_outcome_once(pos_tutup)
         self.stop_session(
             f"kill switch ({self.config.ops.kill_switch_file}) — hapus file itu untuk "
             "mengizinkan sesi baru"
@@ -397,13 +439,25 @@ class TradingEngine:
         """Tutup semua posisi bila batas rugi harian tercapai (sesuai config)."""
         if not self.risk.daily.daily_stopped:
             return False
+        if self._enforcing_limit:
+            return False
         if not self.config.risk.close_all_on_daily_limit:
             self.stop_session("batas rugi harian tercapai")
             return False
-        for pos in self.store.active_positions():
-            await self.executor.close_position(pos.symbol, reason="kill_switch")
-            self.counters["closed"] += 1
-        self.stop_session("batas rugi harian tercapai; semua posisi ditutup")
+        self._enforcing_limit = True
+        try:
+            ditutup: list[str] = []
+            for pos in self.store.active_positions():
+                if await self.executor.close_position(pos.symbol, reason="daily_limit"):
+                    self.counters["closed"] += 1
+                    ditutup.append(pos.symbol)
+            for symbol in ditutup:
+                pos_tutup = self.store.get_position(symbol)
+                if pos_tutup is not None:
+                    await self._record_outcome_once(pos_tutup)
+            self.stop_session("batas rugi harian tercapai; semua posisi ditutup")
+        finally:
+            self._enforcing_limit = False
         self._notify(
             NotifyEvent(
                 kind=NotifyKind.DAILY_STOP,
@@ -426,9 +480,15 @@ class TradingEngine:
         """Hentikan mesin; opsional tutup semua posisi."""
         jumlah = 0
         if close_positions:
+            ditutup: list[str] = []
             for pos in self.store.active_positions():
                 if await self.executor.close_position(pos.symbol, reason="manual"):
                     jumlah += 1
+                    ditutup.append(pos.symbol)
+            for symbol in ditutup:
+                pos_tutup = self.store.get_position(symbol)
+                if pos_tutup is not None:
+                    await self._record_outcome_once(pos_tutup)
         self.stop_session(reason)
         return jumlah
 
@@ -443,13 +503,15 @@ class TradingEngine:
         laporan: ReconcileReport = await self._reconcile(
             broker=self.broker, store=self.store, mode=self.config.ops.mode
         )
-        for insiden in getattr(laporan, "incidents", ()):  # pragma: no branch
+        for aksi in getattr(laporan, "actions", ()):
+            if getattr(aksi, "severity", "info") not in ("warning", "critical"):
+                continue
             self._notify(
                 event_for_incident(
-                    kind=getattr(insiden, "kind", "reconcile"),
-                    severity=getattr(insiden, "severity", "warning"),
-                    detail=getattr(insiden, "detail", str(insiden)),
-                    symbol=getattr(insiden, "symbol", None),
+                    kind=getattr(aksi, "kind", "reconcile"),
+                    severity=getattr(aksi, "severity", "warning"),
+                    detail=getattr(aksi, "detail", str(aksi)),
+                    symbol=getattr(aksi, "symbol", None),
                 )
             )
         return laporan

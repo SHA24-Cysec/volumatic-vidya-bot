@@ -58,6 +58,15 @@ def test_dashboard_demo(tmp_path: Path, capsys: Any) -> None:
     assert "KANDIDAT" in out
 
 
+def test_dashboard_demo_inline(tmp_path: Path, capsys: Any) -> None:
+    """Flag --inline diterima dan tidak mengubah jalur cetak sekali."""
+    cfg = _config(tmp_path)
+    kode = main(["--config", str(cfg), "dashboard", "--demo", "--once", "--inline"])
+    out = capsys.readouterr().out
+    assert kode == 0, out
+    assert "STATUS BOT" in out
+
+
 def test_dashboard_demo_compact(tmp_path: Path, capsys: Any) -> None:
     cfg = _config(tmp_path)
     assert main(["--config", str(cfg), "dashboard", "--demo", "--compact", "--once"]) == 0
