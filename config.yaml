@@ -78,7 +78,7 @@ app:
 #   live     -> order nyata; butuh allow_live: true DAN live_confirmation
 # -----------------------------------------------------------------------------
 ops:
-  mode: "testnet"
+  mode: "dry_run"
   allow_live: false
   # KOSONG dengan sengaja. Untuk mengaktifkan mode live Anda harus mengetik
   # sendiri string berikut (tanpa tanda kutip):
