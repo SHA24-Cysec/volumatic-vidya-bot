@@ -32,6 +32,7 @@ __all__ = [
     "NetConfig",
     "OpsConfig",
     "ProfilOtomatisConfig",
+    "RegimeConfig",
     "RiskConfig",
     "ScoringConfig",
     "Secrets",
@@ -442,7 +443,12 @@ class DashboardConfig(_Strict):
 
     enabled: bool = True
     refresh_sec: float = Field(default=1.5, ge=0.5, le=10)
-    max_log_lines: int = Field(default=12, ge=0, le=100)
+    max_log_lines: int = Field(default=10, ge=0, le=100)
+    #: Pesan log yang sama boleh digabung walau disela pesan lain, asalkan
+    #: selisihnya tidak lebih dari N menit. 0 = hanya yang benar-benar berurutan.
+    #: Bawaan 90 menit karena ipcheck (60 menit) dan refresh simbol (per jam)
+    #: saling berselang sehingga tanpa ini log terlihat penuh pesan identik.
+    log_ulang_jendela_menit: int = Field(default=90, ge=0, le=1440)
     max_signals_shown: int = Field(default=10, ge=1, le=100)
     #: Tampilkan panel ringkas satu blok (cocok untuk layar sempit / log berkas).
     compact: bool = False
@@ -502,6 +508,60 @@ class NotifyConfig(_Strict):
         return self
 
 
+class RegimeConfig(_Strict):
+    """Filter rezim harian (EMA200 harian) untuk sinyal entry.
+
+    Nilai bawaan berasal dari backtest 19 simbol USDT-M 2021-2026 (4h):
+    ``max_dist_pct: -8`` memberi expectancy +0.10 R/trade (vs +0.01 R tanpa
+    filter) dan konsisten di tiga subperiode 2 tahun. Lihat
+    ``docs/tahap-8-filter-rezim.md``.
+    """
+
+    enabled: bool = False
+    ema_length: int = Field(default=200, ge=20, le=1000)
+    atr_length: int = Field(default=14, ge=2, le=200)
+    max_dist_pct: float = Field(default=-8.0, ge=-50, le=50)
+    min_daily_bars: int = Field(default=200, ge=20, le=2000)
+    max_daily_atr_pct: float = Field(default=25.0, gt=0, le=100)
+    daily_kline_limit: int = Field(default=320, ge=60, le=1500)
+    refresh_minutes: float = Field(default=60.0, ge=5, le=1440)
+
+
+class IpCheckConfig(_Strict):
+    """Deteksi IP egress (IP publik yang dipakai bot menghubungi Binance).
+
+    Bawaannya cermat: deteksi hanya dijalankan pada mode yang benar-benar
+    mengirim order (testnet/live), bukan ``dry_run``. Menambah satu koneksi
+    HTTP ke pihak luar tidak boleh terjadi tanpa alasan yang jelas.
+    """
+
+    enabled: bool = True
+    #: Layar yang dipakai untuk membaca IP. Boleh lebih dari satu; dicoba
+    #: berurutan sampai berhasil. Hanya HTTPS yang masuk akal di sini.
+    sumber: list[str] = Field(
+        default_factory=lambda: ["https://api.ipify.org", "https://ifconfig.co/json"]
+    )
+    timeout_sec: float = Field(default=5.0, ge=1, le=30)
+    #: Jalankan otomatis di awal ``run`` mode testnet/live.
+    cek_saat_menjalankan: bool = True
+    #: Berhenti sebelum order pertama bila IP tidak layak (fail-closed).
+    wajib_layak: bool = True
+    #: Tuntut IP publik berhasil terbaca, bukan hanya Binance menerima.
+    wajib_terbaca: bool = True
+    #: Selama sesi ``run`` berjalan, periksa ulang tiap N menit (0 = mati).
+    #: Berguna untuk IP dinamis: IP berubah di tengah sesi berarti masalah baru.
+    ulang_setiap_menit: float = Field(default=60.0, ge=0, le=1440)
+
+    @field_validator("sumber")
+    @classmethod
+    def _validate_sumber(cls, nilai: list[str]) -> list[str]:
+        bersih = [item.strip() for item in nilai if item.strip()]
+        for url in bersih:
+            if not url.startswith("https://"):
+                raise ValueError(f"sumber IP harus HTTPS: {url!r}")
+        return bersih
+
+
 class AppConfig(_Strict):
     """Root konfigurasi (satu file YAML)."""
 
@@ -520,6 +580,8 @@ class AppConfig(_Strict):
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     profil_otomatis: ProfilOtomatisConfig = Field(default_factory=ProfilOtomatisConfig)
+    regime: RegimeConfig = Field(default_factory=RegimeConfig)
+    ipcheck: IpCheckConfig = Field(default_factory=IpCheckConfig)
 
     # ------------------------------------------------------------- database
     def mode_slug(self) -> str:

@@ -54,6 +54,29 @@ class BotStatus:
     cooldown_until: datetime | None = None
     note: str = ""
     kill_reason: str | None = None
+    #: IP egress terakhir yang diketahui bot (kosong = belum diperiksa).
+    ip: str = ""
+    #: Negara menurut layanan pengintip IP (kode ISO bila ada).
+    ip_negara: str = ""
+    #: ``None`` = belum diuji terhadap Binance, ``True``/``False`` = hasil uji.
+    ip_binance: bool | None = None
+    #: Kapan IP terakhir diperiksa (ISO 8601, kosong = tidak ada data).
+    ip_diperiksa: str = ""
+
+    @property
+    def ip_label(self) -> str:
+        """Teks siap tampil untuk baris IP di panel STATUS BOT."""
+        if not self.ip and self.ip_binance is None:
+            return "belum diperiksa"
+        alamat = self.ip or "tak terbaca"
+        negeri = f" ({self.ip_negara})" if self.ip_negara else ""
+        if self.ip_binance is True:
+            status = "Binance OK"
+        elif self.ip_binance is False:
+            status = "Binance MENOLAK"
+        else:
+            status = "Binance belum diuji"
+        return f"{alamat}{negeri} · {status}"
 
     @property
     def pnl_usdt(self) -> float:
@@ -344,6 +367,10 @@ def demo_state(now: float | None = None) -> DashboardState:
             used_margin_pct=41.5,
             max_margin_pct=60.0,
             note="CONTOH TAMPILAN (--demo), bukan data pasar nyata",
+            ip="203.0.113.10",
+            ip_negara="SG",
+            ip_binance=True,
+            ip_diperiksa="2026-11-15T17:50:00",
         ),
         positions=posisi,
         candidates=kandidat,

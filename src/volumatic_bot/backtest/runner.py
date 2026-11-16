@@ -37,6 +37,7 @@ from volumatic_bot.config import AppConfig
 from volumatic_bot.indicator import compute
 from volumatic_bot.indicator.core import entry_signal
 from volumatic_bot.models import CandleSeries
+from volumatic_bot.regime import DailyRegimeFilter, build_regime_from_daily, daily_candles
 from volumatic_bot.risk.plan import Side, build_trade_plan
 from volumatic_bot.risk.sizing import size_position
 
@@ -254,6 +255,18 @@ def costs_source(costs: CostModel) -> str:
     return f"tetap {costs.funding_rate_8h_pct:.4f}%/{costs.funding_interval_hours:.0f}j"
 
 
+def _indeks_rezim_per_bar(series: CandleSeries, rezim: Any) -> Any:
+    """Indeks hari (rezim) yang sudah **selesai** sebelum tiap bar intraday.
+
+    Tanpa look-ahead: bar pada hari D hanya melihat EMA200 harian dari hari
+    D-1 dan sebelumnya. Nilai -1 berarti belum ada hari sebelumnya.
+    """
+    import numpy as np
+
+    day_start = np.asarray(series.open_time, dtype=np.int64) // 86_400_000 * 86_400_000
+    return np.searchsorted(rezim.open_time, day_start, side="left") - 1
+
+
 def _run_loop(
     *,
     series: CandleSeries,
@@ -268,6 +281,8 @@ def _run_loop(
     equity_curve: list[tuple[int, float]],
 ) -> float:
     """Inti loop bar-per-bar. Dipisah agar mudah dibaca dan diuji."""
+    import numpy as np
+
     ind = hasil_indikator
     open_time = series.open_time
     highs = series.high
@@ -276,6 +291,49 @@ def _run_loop(
     opens = series.open
     n = len(series)
     leverage = bt.leverage or config.exchange.default_leverage
+    rezim = None
+    rezim_idx = None
+    if config.regime.enabled:
+        try:
+            harian = daily_candles(series)
+        except ValueError:
+            result.notes.append(
+                "filter rezim harian aktif tetapi data harian tidak bisa dibentuk"
+            )
+            harian = None
+        if harian is not None and len(harian) >= 2:
+            rezim = build_regime_from_daily(
+                CandleSeries.from_columns(
+                    open_time=[int(x) for x in harian.open_time[:-1]],
+                    open=[float(x) for x in harian.open[:-1]],
+                    high=[float(x) for x in harian.high[:-1]],
+                    low=[float(x) for x in harian.low[:-1]],
+                    close=[float(x) for x in harian.close[:-1]],
+                    volume=[float(x) for x in harian.volume[:-1]],
+                ),
+                ema_length=config.regime.ema_length,
+                atr_length=config.regime.atr_length,
+            )
+            rezim_idx = _indeks_rezim_per_bar(series, rezim)
+            result.notes.append(
+                f"filter rezim harian aktif: EMA{config.regime.ema_length} harian, "
+                f"batas {config.regime.max_dist_pct:+.1f}% (dari {len(rezim)} hari)"
+            )
+        else:
+            result.notes.append(
+                "filter rezim harian aktif tetapi data harian < 2 hari; "
+                "seluruh entry ditolak"
+            )
+    filt = (
+        DailyRegimeFilter(
+            enabled=True,
+            max_dist_pct=config.regime.max_dist_pct,
+            min_daily_bars=config.regime.min_daily_bars,
+            max_daily_atr_pct=config.regime.max_daily_atr_pct,
+        )
+        if config.regime.enabled
+        else None
+    )
     cooldown_sampai = -1
     menunggu_entry: str | None = None
     durasi = 0
@@ -337,7 +395,32 @@ def _run_loop(
         if manager.position is None and menunggu_entry is None:
             arah = entry_signal(ind, i)
             if arah is not None and float(ind.atr[i]) > 0:
-                menunggu_entry = arah
+                ditolak_rezim = None
+                if filt is not None and rezim is not None and rezim_idx is not None:
+                    hari = int(rezim_idx[i])
+                    if hari < 0 or hari >= len(rezim):
+                        ditolak_rezim = "data harian belum mencakup tanggal sinyal"
+                    else:
+                        dist = rezim.dist_pct(hari, close)
+                        atr_pct = float(rezim.atr_pct[hari])
+                        side_sign = 1.0 if arah == "long" else -1.0
+                        if not bool(np.isfinite(dist)):
+                            ditolak_rezim = "EMA200 harian belum terbentuk"
+                        elif np.isfinite(atr_pct) and atr_pct > config.regime.max_daily_atr_pct:
+                            batas_atr = config.regime.max_daily_atr_pct
+                            ditolak_rezim = f"ATR harian {atr_pct:.1f}% > {batas_atr:.1f}%"
+                        elif dist * side_sign > config.regime.max_dist_pct:
+                            ditolak_rezim = (
+                                f"jarak EMA200 harian {dist * side_sign:+.1f}% > "
+                                f"{config.regime.max_dist_pct:+.1f}% "
+                                f"(harga belum terentang melawan arah {arah})"
+                            )
+                if ditolak_rezim is not None:
+                    result.skipped.append(
+                        f"{_jam(ts)} {arah}: ditolak filter rezim ({ditolak_rezim})"
+                    )
+                else:
+                    menunggu_entry = arah
 
         if manager.position is None:
             equity_curve.append((ts, equity))

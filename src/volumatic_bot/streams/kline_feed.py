@@ -13,6 +13,7 @@ Aturan penting:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 
@@ -20,6 +21,14 @@ from volumatic_bot.binance.kline_messages import KlineEvent
 from volumatic_bot.indicator.core import IndicatorResult, compute, entry_signal
 from volumatic_bot.indicator.params import IndicatorParams
 from volumatic_bot.models import CandleSeries
+from volumatic_bot.regime import (
+    DailyRegime,
+    DailyRegimeFilter,
+    build_regime_from_daily,
+    daily_candles,
+)
+
+logger = logging.getLogger("volumatic_bot.streams.kline_feed")
 
 __all__ = ["KlineFeed", "SignalEvent"]
 
@@ -136,8 +145,17 @@ class KlineFeed:
         on_signal: OnSignal | None = None,
         offload: bool = True,
         scores: Mapping[str, float] | None = None,
+        regime_filter: DailyRegimeFilter | None = None,
+        regime_ema_length: int = 200,
+        regime_atr_length: int = 14,
     ) -> None:
         self.params = params or IndicatorParams()
+        #: Filter rezim harian. ``None`` = nonaktif (perilaku lama).
+        self.regime_filter = regime_filter
+        self.regime_ema_length = int(regime_ema_length)
+        self.regime_atr_length = int(regime_atr_length)
+        self._regime: dict[str, DailyRegime] = {}
+        self.regime_rejected = 0
         self.max_bars = max_bars
         self._on_signal = on_signal
         self._offload = offload
@@ -160,6 +178,57 @@ class KlineFeed:
     def seed_many(self, series_map: Mapping[str, CandleSeries]) -> None:
         for symbol, series in series_map.items():
             self.seed(symbol, series)
+
+    def seed_regime(self, symbol: str, daily: CandleSeries) -> None:
+        """Simpan candle harian (sudah tertutup) lalu hitung rezim EMA200-nya."""
+        if self.regime_filter is None:
+            return
+        self._regime[symbol.upper()] = build_regime_from_daily(
+            daily,
+            ema_length=self.regime_ema_length,
+            atr_length=self.regime_atr_length,
+        )
+
+    def seed_regime_series(self, symbol: str, series: CandleSeries) -> None:
+        """Bangun candle harian dari riwayat intraday (jalur backtest/offline)."""
+        if self.regime_filter is None:
+            return
+        try:
+            harian = daily_candles(series)
+        except ValueError:
+            return
+        if len(harian) < 2:
+            return
+        # Hari terakhir bisa belum selesai; buang dari perhitungan rezim.
+        self.seed_regime(
+            symbol,
+            CandleSeries.from_columns(
+                open_time=[int(x) for x in harian.open_time[:-1]],
+                open=[float(x) for x in harian.open[:-1]],
+                high=[float(x) for x in harian.high[:-1]],
+                low=[float(x) for x in harian.low[:-1]],
+                close=[float(x) for x in harian.close[:-1]],
+                volume=[float(x) for x in harian.volume[:-1]],
+            ),
+        )
+
+    def regime_for(self, symbol: str) -> DailyRegime | None:
+        return self._regime.get(symbol.upper())
+
+    def _regime_allows(self, symbol: str, direction: str, close: float, open_time: int) -> bool:
+        """False bila filter rezim aktif dan menolak sinyal ini."""
+        if self.regime_filter is None or not self.regime_filter.enabled:
+            return True
+        lolos, alasan = self.regime_filter.check(
+            self._regime.get(symbol.upper()),
+            close=close,
+            day_start_ms=(int(open_time) // 86_400_000) * 86_400_000,
+            direction=direction,
+        )
+        if not lolos:
+            self.regime_rejected += 1
+            logger.info("sinyal %s %s ditahan filter rezim: %s", symbol, direction, alasan)
+        return lolos
 
     def set_score(self, symbol: str, score: float) -> None:
         self._scores[symbol.upper()] = score
@@ -203,6 +272,8 @@ class KlineFeed:
                 self.last_atr[symbol] = atr
         direction = entry_signal(result, -1)
         if direction is None:
+            return None
+        if not self._regime_allows(symbol, direction, float(event.close), int(event.open_time)):
             return None
         signal = self._build_signal(event, result, direction)
         self.signals += 1

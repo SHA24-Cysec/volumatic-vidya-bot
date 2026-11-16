@@ -188,6 +188,7 @@ class TradingEngine:
     async def handle_signal(self, signal: SignalEvent) -> EngineResult:
         """Proses satu sinyal: filter buku → risiko → eksekusi."""
         self.counters["signals"] += 1
+        await self._exit_on_flip(signal)
         kunci = (signal.symbol, signal.direction, int(signal.open_time))
         if kunci in self.seen:
             return EngineResult("duplicate", signal.symbol, "sinyal yang sama sudah diproses")
@@ -334,6 +335,46 @@ class TradingEngine:
         return entry + risiko * r if pos.side == "long" else entry - risiko * r
 
     # --------------------------------------------------------------- order
+    async def _exit_on_flip(self, signal: SignalEvent) -> bool:
+        """Tutup posisi terbuka bila tren indikator berbalik arah.
+
+        Sebelum perbaikan ini, ``trade.exit_on_trend_flip: true`` hanya ada di
+        config dan **tidak pernah dieksekusi**: tidak ada kode yang membaca
+        nilainya. Akibatnya posisi dibiarkan sampai SL/TP walau tren VIDYA
+        sudah berbalik (padahal indikator ini justru pemberi sinyal perubahan
+        tren). Fungsi ini dipanggil dari :meth:`handle_signal`, yang selalu
+        dijalankan ``KlineFeed`` setiap candle tertutup memberi sinyal.
+        """
+        if not self.config.trade.exit_on_trend_flip:
+            return False
+        pos = self.store.get_position(signal.symbol)
+        if pos is None or not pos.active:
+            return False
+        searah = (pos.side == "long" and signal.trend > 0) or (
+            pos.side == "short" and signal.trend < 0
+        )
+        if searah:
+            return False
+        self._notify(
+            NotifyEvent(
+                kind=NotifyKind.INCIDENT,
+                title=f"tren berbalik: tutup {pos.symbol}",
+                detail=(
+                    f"tren VIDYA sekarang {signal.trend:+d}, posisi {pos.side}; "
+                    "menutup posisi (trade.exit_on_trend_flip)"
+                ),
+                level=NotifyLevel.WARNING,
+                symbol=pos.symbol,
+            )
+        )
+        logger.info(
+            "exit_on_trend_flip: %s tren=%+d posisi=%s -> tutup",
+            pos.symbol,
+            signal.trend,
+            pos.side,
+        )
+        return await self.executor.close_position(pos.symbol, reason="trend_flip")
+
     async def handle_order_update(self, update: Any) -> None:
         """Teruskan event User Data Stream ke eksekutor, lalu tangani penutupan."""
         await self.executor.on_order_update(update)

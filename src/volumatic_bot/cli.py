@@ -164,6 +164,7 @@ def _cmd_indicator(args: argparse.Namespace) -> int:
     config, secrets = _load(args)
     setup_logging(config.app.log_level, secrets=secrets.secret_values())
     candles = load_candles_csv(args.candles, max_rows=args.rows)
+    candles = _samakan_interval(candles, config.scanner.timeframe)
     params = config.indicator.to_params()
     result = compute(candles, params)
     tail = args.show
@@ -556,6 +557,40 @@ def _muat_funding(path: Path) -> Any:
     return muat_funding(path)
 
 
+def _samakan_interval(candles: Any, target: str) -> Any:
+    """Resample candle bila interval data lebih kecil dari ``scanner.timeframe``.
+
+    Tanpa ini, berkas 15m bisa dilaporkan sebagai "4h" hanya karena config
+    berubah, padahal mesin tetap memakai bar 15m: label salah dan ATR/SL ikut
+    salah skala. Data yang lebih besar dari target ditolak dengan pesan jelas.
+    """
+    from volumatic_bot.binance.urls import INTERVAL_MS
+    from volumatic_bot.data.loaders import resample_candles, tebak_interval
+
+    asal = tebak_interval(candles)
+    if asal == target:
+        return candles
+    if asal is None:
+        print(
+            "PERINGATAN: interval data tidak bisa ditebak; dianggap sama dengan "
+            f"scanner.timeframe ({target}). Periksa apakah berkas berisi bar {target}.",
+            file=sys.stderr,
+        )
+        return candles
+    if INTERVAL_MS[asal] > INTERVAL_MS[target]:
+        print(
+            f"data {asal} lebih besar dari scanner.timeframe {target}: "
+            f"tidak bisa dipecah ke interval lebih kecil. Sediakan data {target}.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    hasil = resample_candles(candles, target)
+    print(
+        f"(data {asal} di-resample ke {target}: {len(candles)} bar -> {len(hasil)} bar lengkap)"
+    )
+    return hasil
+
+
 def _cmd_backtest(args: argparse.Namespace) -> int:
     """Backtest tanpa jaringan: candle historis + model biaya eksplisit."""
     import json
@@ -568,6 +603,7 @@ def _cmd_backtest(args: argparse.Namespace) -> int:
     setup_logging(config.app.log_level, secrets=secrets.secret_values())
 
     candles = load_candles_csv(args.candles, max_rows=args.rows)
+    candles = _samakan_interval(candles, config.scanner.timeframe)
     info_all = parse_exchange_info(json.loads(Path(args.exchange_info).read_text(encoding="utf-8")))
     simbol = (args.symbol or _symbol_dari_nama(args.candles)).upper()
     try:
@@ -708,6 +744,7 @@ def _cmd_simulate_session(args: argparse.Namespace) -> int:
     setup_logging(config.app.log_level, secrets=secrets.secret_values())
 
     candles = load_candles_csv(args.candles)
+    candles = _samakan_interval(candles, config.scanner.timeframe)
     info_all = parse_exchange_info(json.loads(Path(args.exchange_info).read_text(encoding="utf-8")))
     simbol = (args.symbol or _symbol_dari_nama(args.candles)).upper()
     try:
@@ -875,6 +912,59 @@ async def _uji_host(url: str, secrets: Any, config: AppConfig) -> tuple[bool, st
             await klien.close()
 
 
+async def _periksa_ip(config: AppConfig, secrets: Any, *, uji_binance: bool) -> Any:
+    """Baca IP publik lalu (opsional) uji penerimaan Binance. Tanpa mencetak apa pun."""
+    from volumatic_bot.net.ipcheck import ambil_ip_publik, periksa_binance, sumber_dari_url
+
+    sumber = tuple(sumber_dari_url(u) for u in config.ipcheck.sumber)
+    laporan = await ambil_ip_publik(sumber, timeout_sec=config.ipcheck.timeout_sec)
+    if uji_binance:
+        rest = _make_rest(config, secrets)
+        await rest.start()
+        try:
+            await periksa_binance(laporan, rest=rest)
+        finally:
+            with contextlib.suppress(Exception):
+                await rest.close()
+    return laporan
+
+
+def _cmd_ip(args: argparse.Namespace) -> int:
+    """Tampilkan IP egress dan apakah Binance menerimanya.
+
+    Perintah ini tidak mengirim order dan tidak butuh API key: endpoint yang
+    dipakai (ping, server time) publik.
+    """
+    from volumatic_bot.net.ipcheck import ringkas_laporan, wajib_layak
+
+    config, secrets = _load(args)
+    setup_logging(config.app.log_level, secrets=secrets.secret_values())
+    if not config.ipcheck.enabled:
+        print(
+            "ipcheck.enabled: false di config, jadi deteksi IP dimatikan. "
+            "Perintah ini tetap jalan karena Anda memintanya secara eksplisit.",
+            file=sys.stderr,
+        )
+    url = config.net.resolve_rest_url(testnet=config.exchange.testnet)
+    print(f"mode         : {config.ops.mode} (testnet={config.exchange.testnet})")
+    print(f"target REST  : {url}")
+    uji = not args.tanpa_binance
+    if uji:
+        print("menguji Binance: ping + server time (bobot 1, tanpa API key)")
+    laporan = asyncio.run(_periksa_ip(config, secrets, uji_binance=uji))
+    print("")
+    for baris in ringkas_laporan(laporan):
+        print(baris)
+    print("")
+    if uji:
+        layak, alasan = wajib_layak(laporan, wajib_terbaca=config.ipcheck.wajib_terbaca)
+        status = "LAYAK" if layak else "TIDAK LAYAK"
+        print(f"kesimpulan   : {status} — {alasan}")
+        return 0 if layak else 1
+    print("kesimpulan   : IP terbaca; status terhadap Binance tidak diuji (--tanpa-binance)")
+    return 0 if laporan.terbaca else 1
+
+
 def _cmd_netcheck(args: argparse.Namespace) -> int:
     """Cek koneksi ke Binance langkah demi langkah (tanpa mengirim order).
 
@@ -891,6 +981,13 @@ def _cmd_netcheck(args: argparse.Namespace) -> int:
     print(f"WebSocket   : {ws}")
     print(f"kredensial  : {'ada' if secrets.has_api_credentials else 'BELUM DISET'}")
     print("")
+    if config.ipcheck.enabled:
+        from volumatic_bot.net.ipcheck import ringkas_laporan
+
+        laporan = asyncio.run(_periksa_ip(config, secrets, uji_binance=False))
+        for baris in ringkas_laporan(laporan):
+            print(baris)
+        print("")
 
     gagal = 0
 
@@ -1114,6 +1211,43 @@ def _cmd_kill_switch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _lolos_pemeriksaan_ip(
+    config: AppConfig, secrets: Any, *, mode: str
+) -> tuple[bool, Any]:
+    """Gerbang IP sebelum ``run`` mengirim order.
+
+    Fail-closed untuk mode testnet/live: bila IP tidak terbukti diterima
+    Binance, sesi tidak dimulai. Alasannya praktis, bukan teoretis: dengan IP
+    yang ditolak, order pertama akan gagal setelah bot menghangatkan puluhan
+    candle, dan pada mode ``live`` kegagalan bisa terjadi tepat saat posisi
+    butuh SL. Lebih murah berhenti di sini.
+    """
+    from volumatic_bot.net.ipcheck import ringkas_laporan, wajib_layak
+
+    if not config.ipcheck.enabled or not config.ipcheck.cek_saat_menjalankan:
+        return True, None
+    print("memeriksa IP egress sebelum mode " + mode + "...", flush=True)
+    laporan = asyncio.run(_periksa_ip(config, secrets, uji_binance=True))
+    for baris in ringkas_laporan(laporan):
+        print("  " + baris, flush=True)
+    if not config.ipcheck.wajib_layak:
+        print("  catatan: ipcheck.wajib_layak=false, sesi diteruskan apa pun hasilnya", flush=True)
+        return True, laporan
+    layak, alasan = wajib_layak(laporan, wajib_terbaca=config.ipcheck.wajib_terbaca)
+    if layak:
+        print("  IP layak: sesi dilanjutkan.", flush=True)
+        return True, laporan
+    print("", file=sys.stderr)
+    print(f"sesi DIBATALKAN: {alasan}", file=sys.stderr)
+    print(
+        "Perbaiki IP/whitelist lebih dulu, atau jalankan `volumatic-bot ip` untuk "
+        "melihat rinciannya. Bila Anda memang ingin memaksa jalan, setel "
+        "ipcheck.wajib_layak: false (tidak disarankan).",
+        file=sys.stderr,
+    )
+    return False, laporan
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     """Jalankan mesin trading dengan data bursa (butuh kredensial & jaringan).
 
@@ -1133,6 +1267,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         return 2
 
+    lolos_ip, laporan_ip = _lolos_pemeriksaan_ip(config, secrets, mode=config.ops.mode)
+    if not lolos_ip:
+        return 3
+
     from volumatic_bot.binance.errors import BinanceAPIError
     from volumatic_bot.engine.live import run_live_session
 
@@ -1146,6 +1284,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 dashboard=not args.no_dashboard,
                 config_path=args.config,
                 profil=getattr(args, "profil", None),
+                laporan_ip=laporan_ip,
             )
         )
     except ValueError as exc:
@@ -1191,7 +1330,12 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
             return contoh
 
         app = DashboardApp(
-            sumber_demo, console=console, refresh_sec=refresh, compact=compact, screen=screen
+            sumber_demo,
+            console=console,
+            refresh_sec=refresh,
+            compact=compact,
+            screen=screen,
+            jendela_menit=config.dashboard.log_ulang_jendela_menit,
         )
         if args.iterations is not None and args.iterations > 1 and console.is_terminal:
             return 0 if asyncio.run(app.run(iterations=args.iterations)) else 1
@@ -1231,7 +1375,12 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
             return source.snapshot()
 
         app = DashboardApp(
-            ambil, console=console, refresh_sec=refresh, compact=compact, screen=screen
+            ambil,
+            console=console,
+            refresh_sec=refresh,
+            compact=compact,
+            screen=screen,
+            jendela_menit=config.dashboard.log_ulang_jendela_menit,
         )
         if not args.once and console.is_terminal:
             frames = asyncio.run(app.run(iterations=args.iterations))
@@ -1424,6 +1573,15 @@ def _cmd_preflight(args: argparse.Namespace) -> int:
             f"{'aktif' if config.orderbook.enabled else 'dimatikan'} "
             f"(sumber {config.orderbook.source}, tolak bila depth hilang="
             f"{config.orderbook.reject_if_unavailable})",
+        )
+    )
+    baris.append(
+        (
+            "deteksi IP",
+            True,
+            "aktif saat run testnet/live"
+            + (" (WAJIB layak: sesi dibatalkan bila tidak)" if config.ipcheck.wajib_layak else "")
+            + ("" if config.ipcheck.enabled else " — DIMATIKAN di config"),
         )
     )
     cache_dir = Path(config.db_cache()).parent
@@ -2183,6 +2341,16 @@ def build_parser() -> argparse.ArgumentParser:
     kill.add_argument("--clear", action="store_true", help="hapus file kill switch")
     kill.add_argument("--status", action="store_true", help="hanya periksa status")
     kill.set_defaults(func=_cmd_kill_switch)
+
+    ipc = sub.add_parser(
+        "ip", help="(jaringan) tampilkan IP egress dan apakah Binance menerimanya"
+    )
+    ipc.add_argument(
+        "--tanpa-binance",
+        action="store_true",
+        help="hanya baca IP publik, jangan menghubungi Binance",
+    )
+    ipc.set_defaults(func=_cmd_ip)
 
     net = sub.add_parser("netcheck", help="(jaringan) cek koneksi ke Binance langkah demi langkah")
     net.set_defaults(func=_cmd_netcheck)

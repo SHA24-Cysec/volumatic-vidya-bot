@@ -46,6 +46,7 @@ class DashboardApp:
         refresh_sec: float = 1.5,
         compact: bool = False,
         screen: bool = True,
+        jendela_menit: int = 0,
     ) -> None:
         if refresh_sec <= 0:
             raise ValueError("refresh_sec harus > 0")
@@ -54,6 +55,7 @@ class DashboardApp:
         self._refresh = refresh_sec
         self._compact = compact
         self._screen = screen
+        self._jendela_menit = max(0, int(jendela_menit))
         self.frames = 0
         self.errors = 0
 
@@ -68,7 +70,12 @@ class DashboardApp:
             return DashboardState(status=_status_galat(), error=str(exc))
 
     def renderable(self, state: DashboardState) -> RenderableType:
-        return render_state(state, compact=self._compact, width=self._console.size.width)
+        return render_state(
+            state,
+            compact=self._compact,
+            width=self._console.size.width,
+            jendela_menit=self._jendela_menit,
+        )
 
     # ------------------------------------------------------------------ mode
     def render_once(self, *, state: DashboardState | None = None) -> str:

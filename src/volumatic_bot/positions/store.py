@@ -76,6 +76,20 @@ class PositionStore:
         self.db = db
 
     # -------------------------------------------------------------- posisi
+    # ------------------------------------------------------------- key-value
+    def set_state(self, key: str, value: str) -> None:
+        """Simpan satu nilai kecil (dipakai untuk status IP egress)."""
+        self.db.execute(
+            "INSERT INTO kv(key, value, updated_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value, _now_ms()),
+        )
+
+    def get_state(self, key: str) -> str | None:
+        """Baca nilai yang disimpan :meth:`set_state` (``None`` bila belum ada)."""
+        rows = self.db.execute("SELECT value FROM kv WHERE key = ?", (key,))
+        return str(rows[0][0]) if rows else None
+
     def save_position(self, pos: TrackedPosition) -> None:
         self.db.execute(
             """

@@ -61,6 +61,22 @@ def _warna_pnl(nilai: float | None) -> str:
     return _UP if nilai > 0 else _DOWN
 
 
+def _jam_ip(iso: str) -> str:
+    """Ringkas waktu pemeriksaan IP menjadi ``HH:MM`` lokal (kosong bila tak ada)."""
+    if not iso:
+        return "-"
+    from datetime import datetime
+
+    try:
+        saat = datetime.fromisoformat(iso)
+    except ValueError:
+        return iso[:16]
+    if saat.tzinfo is not None:
+        # Simpan sebagai waktu dinding lokal pengguna, bukan zona server.
+        saat = saat.astimezone()
+    return saat.strftime("%H:%M")
+
+
 def _uptime(detik: float) -> str:
     total = max(0, int(detik))
     jam, sisa = divmod(total, 3600)
@@ -137,6 +153,16 @@ def status_panel(
         "Cooldown",
         Text(_cooldown_text(status.cooldown_until)),
     )
+    # Baris IP hanya muncul bila ada datanya: dashboard mode dry_run/demo tidak
+    # memeriksa IP, dan baris kosong hanya memakan tempat.
+    if status.ip or status.ip_binance is not None:
+        warna = "green" if status.ip_binance else ("red" if status.ip_binance is False else "")
+        grid.add_row(
+            "IP egress",
+            Text(status.ip_label, style=warna),
+            "Diperiksa",
+            Text(_jam_ip(status.ip_diperiksa)),
+        )
     if metrics is not None:
         grid.add_row(
             "Bandwidth",
@@ -307,10 +333,17 @@ def events_panel(
     *,
     max_logs: int = 12,
     max_incidents: int = 4,
+    jendela_menit: int = 0,
 ) -> Panel:
     """Panel 4: insiden terbaru (paling penting) + ekor log."""
+    from volumatic_bot.dashboard.ringkas import ringkas_log
+
     insiden = list(incidents)[:max_incidents]
-    log = list(logs)[-max_logs:] if max_logs else []
+    # Log diringkas dulu (pesan berulang digabung, daftar simbol jadi jumlah),
+    # baru diambil N terakhir. Tanpa ini, 12 baris terakhir bisa terisi pesan
+    # yang sama berulang-ulang dan menenggelamkan kejadian lain.
+    semua = ringkas_log(logs, jendela_menit=jendela_menit)
+    log = semua[-max_logs:] if max_logs else []
     isi: list[RenderableType] = []
     if insiden:
         isi.append(Text("INSIDEN (perlu perhatian)", style="bold yellow"))
@@ -325,7 +358,11 @@ def events_panel(
 
 # ----------------------------------------------------------------- gabungan
 def render_state(
-    state: DashboardState, *, compact: bool = False, width: int | None = None
+    state: DashboardState,
+    *,
+    compact: bool = False,
+    width: int | None = None,
+    jendela_menit: int = 0,
 ) -> RenderableType:
     """Susun semua panel menjadi satu renderable.
 
@@ -341,7 +378,7 @@ def render_state(
         status_panel(state.status, state.metrics, wide=lebar_cukup),
         positions_panel(state.positions, show_history=True, wide=lebar_cukup),
         candidates_panel(state.candidates, wide=lebar_cukup),
-        events_panel(state.incidents, state.logs),
+        events_panel(state.incidents, state.logs, jendela_menit=jendela_menit),
     ]
     if state.error:
         bagian.insert(0, Text(f"galat dashboard: {state.error}", style="bold red"))

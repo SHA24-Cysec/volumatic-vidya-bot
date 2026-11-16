@@ -21,7 +21,14 @@ import pandas as pd
 
 from volumatic_bot.models import CandleSeries
 
-__all__ = ["candles_to_frame", "detect_header", "load_candles_csv", "to_epoch_ms"]
+__all__ = [
+    "candles_to_frame",
+    "detect_header",
+    "load_candles_csv",
+    "resample_candles",
+    "tebak_interval",
+    "to_epoch_ms",
+]
 
 _REQUIRED = ("open", "high", "low", "close", "volume")
 
@@ -110,6 +117,74 @@ def load_candles_csv(path: str | Path, *, max_rows: int | None = None) -> Candle
         low=frame["low"].to_numpy(dtype=np.float64),
         close=frame["close"].to_numpy(dtype=np.float64),
         volume=frame["volume"].to_numpy(dtype=np.float64),
+    )
+
+
+def tebak_interval(candles: CandleSeries) -> str | None:
+    """Tebak interval candle dari selisih waktu antar bar (``None`` bila tidak pasti)."""
+    from volumatic_bot.binance.urls import INTERVAL_MS
+
+    if len(candles.open_time) < 3:
+        return None
+    selisih = np.diff(np.asarray(candles.open_time, dtype=np.int64))
+    tengah = int(np.median(selisih))
+    for nama, lebar in INTERVAL_MS.items():
+        if nama == "1M":
+            continue
+        if lebar == tengah:
+            return nama
+    return None
+
+
+def resample_candles(candles: CandleSeries, target: str) -> CandleSeries:
+    """Gabungkan candle ke interval lebih besar (mis. 15m -> 4h).
+
+    Hanya ember yang lengkap dipakai, agar indikator tidak melihat bar setengah
+    jadi di ujung data. Data dengan interval lebih kecil atau sama dikembalikan
+    apa adanya.
+    """
+    from volumatic_bot.binance.urls import INTERVAL_MS
+
+    if target not in INTERVAL_MS:
+        raise ValueError(f"interval tidak dikenal: {target}")
+    asal = tebak_interval(candles)
+    if asal is None:
+        raise ValueError("interval data tidak bisa ditebak; pakai data berjarak tetap")
+    if INTERVAL_MS[asal] > INTERVAL_MS[target]:
+        raise ValueError(f"data {asal} lebih besar dari target {target}; tidak bisa di-resample")
+    if asal == target:
+        return candles
+
+    lebar = INTERVAL_MS[target]
+    per_ember = lebar // INTERVAL_MS[asal]
+    waktu = np.asarray(candles.open_time, dtype=np.int64)
+    ember = waktu // lebar * lebar
+    frame = pd.DataFrame(
+        {
+            "b": ember,
+            "o": np.asarray(candles.open, dtype=float),
+            "h": np.asarray(candles.high, dtype=float),
+            "l": np.asarray(candles.low, dtype=float),
+            "c": np.asarray(candles.close, dtype=float),
+            "v": np.asarray(candles.volume, dtype=float),
+        }
+    )
+    gabung = frame.groupby("b").agg(
+        o=("o", "first"),
+        h=("h", "max"),
+        l=("l", "min"),
+        c=("c", "last"),
+        v=("v", "sum"),
+        n=("b", "size"),
+    )
+    gabung = gabung[gabung["n"] == per_ember]
+    return CandleSeries.from_columns(
+        open_time=[int(x) for x in gabung.index],
+        open=[float(x) for x in gabung["o"]],
+        high=[float(x) for x in gabung["h"]],
+        low=[float(x) for x in gabung["l"]],
+        close=[float(x) for x in gabung["c"]],
+        volume=[float(x) for x in gabung["v"]],
     )
 
 

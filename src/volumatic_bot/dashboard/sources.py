@@ -14,6 +14,7 @@ angka nol dan baris "belum ada ...", bukan angka karangan.
 from __future__ import annotations
 
 import time
+from contextlib import suppress
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
@@ -75,6 +76,10 @@ class LocalStateSource:
         self.log_lines: list[EventLine] = []
         self.daily_state: DailyState | None = None
         self.note = ""
+        self.ip = ""
+        self.ip_negara = ""
+        self.ip_binance: bool | None = None
+        self.ip_diperiksa = ""
 
     # ------------------------------------------------------ suntikan bot
     def set_mark(self, symbol: str, price: Decimal) -> None:
@@ -85,6 +90,25 @@ class LocalStateSource:
 
     def set_logs(self, lines: Iterable[EventLine]) -> None:
         self.log_lines = list(lines)
+
+    def set_ip(
+        self,
+        ip: str,
+        *,
+        negara: str = "",
+        binance: bool | None = None,
+        diperiksa: str = "",
+    ) -> None:
+        """Simpan hasil pemeriksaan IP terakhir.
+
+        Dashboard sengaja **tidak** memanggil layanan IP sendiri: panel status
+        harus tetap bisa digambar tanpa jaringan (``dashboard --demo`` atau
+        membaca database lama). Yang menulis ke sini adalah sesi ``run``.
+        """
+        self.ip = ip
+        self.ip_negara = negara
+        self.ip_binance = binance
+        self.ip_diperiksa = diperiksa
 
     # --------------------------------------------------------------- ambil
     def __call__(self) -> DashboardState:
@@ -103,6 +127,7 @@ class LocalStateSource:
 
         catatan = self._store.incidents(limit=self._incident_limit)
         insiden = [EventLine.from_incident(rec) for rec in catatan]
+        self._muat_ip_dari_state()
         status = self._status(len(posisi_aktif), baris)
         return DashboardState(
             status=status,
@@ -112,6 +137,27 @@ class LocalStateSource:
             logs=list(self.log_lines),
             metrics=self._metrics.snapshot() if self._metrics is not None else None,
         )
+
+    def _muat_ip_dari_state(self) -> None:
+        """Ambil IP terakhir dari SQLite bila belum ada di memori.
+
+        Perintah ``dashboard`` berjalan sebagai proses terpisah, jadi satu-satunya
+        jalur informasi dari sesi ``run`` adalah database.
+        """
+        if self.ip or self.ip_binance is not None:
+            return
+        with suppress(Exception):
+            mentah = self._store.get_state("ip_egress")
+            if not mentah:
+                return
+            bagian = mentah.split("|")
+            if len(bagian) < 4:
+                return
+            self.ip = bagian[0]
+            self.ip_negara = bagian[1]
+            if bagian[2] in ("0", "1"):
+                self.ip_binance = bagian[2] == "1"
+            self.ip_diperiksa = bagian[3]
 
     def _status(self, jumlah_aktif: int, baris: list[PositionRow]) -> BotStatus:
         ekuitas, kerugian, trades = self._daily()
@@ -144,6 +190,10 @@ class LocalStateSource:
             cooldown_until=ds.cooldown_until if ds is not None else None,
             kill_reason=(ds.kill_reason if ds is not None else None),
             note=self.note,
+            ip=self.ip,
+            ip_negara=self.ip_negara,
+            ip_binance=self.ip_binance,
+            ip_diperiksa=self.ip_diperiksa,
         )
 
     def trading_day(self, now: datetime | None = None) -> str:

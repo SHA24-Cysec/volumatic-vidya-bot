@@ -282,3 +282,64 @@ async def test_periodic_memanggil_reconcile(store: PositionStore) -> None:
     laporan = await engine.periodic()
     assert laporan is not None
     assert dipanggil == ["dry_run"]
+
+
+# ------------------------------------------------------- exit saat tren berbalik
+def _sinyal_arah(arah: str, tren: int) -> SignalEvent:
+    dasar = sinyal(arah=arah)
+    return SignalEvent(
+        symbol=dasar.symbol,
+        direction=arah,
+        open_time=dasar.open_time,
+        close_price=dasar.close_price,
+        upper=dasar.upper,
+        lower=dasar.lower,
+        trail=dasar.trail,
+        atr=dasar.atr,
+        atr_pct=dasar.atr_pct,
+        cmo=dasar.cmo,
+        trend=tren,
+        vol_delta_pct=dasar.vol_delta_pct,
+        vol_delta_win_pct=dasar.vol_delta_win_pct,
+        zone_count=dasar.zone_count,
+        score=dasar.score,
+        bars=dasar.bars,
+    )
+
+
+@pytest.mark.asyncio
+async def test_exit_on_trend_flip_menutup_posisi_saat_tren_berbalik(store: PositionStore) -> None:
+    """``trade.exit_on_trend_flip`` dulu hanya ada di config; sekarang dieksekusi."""
+    cfg = config(risk={"risk_per_trade_pct": 0.5}, trade={"exit_on_trend_flip": True})
+    engine, _broker, _, kanal = rakit(store, cfg=cfg)
+    await engine.handle_signal(_sinyal_arah("long", tren=1))
+    pos = store.get_position("DOGEUSDT")
+    assert pos is not None and pos.state is PositionState.OPEN
+
+    hasil = await engine.handle_signal(_sinyal_arah("short", tren=-1))
+    assert hasil is not None
+    # Posisi long lama harus ditutup oleh aturan flip; posisi yang tersisa
+    # (bila ada) adalah SHORT baru dari sinyal yang sama, bukan long lama.
+    pos2 = store.get_position("DOGEUSDT")
+    assert pos2 is None or pos2.side == "short"
+    assert any("tren berbalik" in (p.title or "") for p in kanal.pesan)
+
+
+@pytest.mark.asyncio
+async def test_exit_on_trend_flip_tidak_menutup_bila_searah(store: PositionStore) -> None:
+    cfg = config(risk={"risk_per_trade_pct": 0.5}, trade={"exit_on_trend_flip": True})
+    engine, _broker, _, _ = rakit(store, cfg=cfg)
+    await engine.handle_signal(_sinyal_arah("long", tren=1))
+    await engine.handle_signal(_sinyal_arah("short", tren=1))
+    pos = store.get_position("DOGEUSDT")
+    assert pos is not None and pos.state is PositionState.OPEN
+
+
+@pytest.mark.asyncio
+async def test_exit_on_trend_flip_mati_tidak_menutup_posisi(store: PositionStore) -> None:
+    cfg = config(risk={"risk_per_trade_pct": 0.5}, trade={"exit_on_trend_flip": False})
+    engine, _broker, _, _ = rakit(store, cfg=cfg)
+    await engine.handle_signal(_sinyal_arah("long", tren=1))
+    await engine.handle_signal(_sinyal_arah("short", tren=-1))
+    pos = store.get_position("DOGEUSDT")
+    assert pos is not None and pos.state is PositionState.OPEN

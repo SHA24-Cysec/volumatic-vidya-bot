@@ -93,6 +93,25 @@ class SymbolFilters:
             rounded = steps.to_integral_value(rounding=ROUND_DOWN)
         return (rounded * self.step_size).quantize(self.step_size)
 
+    def stop_outside_entry(
+        self, entry: float | Decimal, stop: float | Decimal, *, side: str, mode: str
+    ) -> Decimal:
+        """Bulatkan SL ke tick dengan jaminan **tidak menempel di entry**.
+
+        ``round_price`` bisa menghasilkan SL == entry bila jarak SL lebih kecil
+        dari satu tick (ATR sangat kecil, mis. 4h pada koin berharga receh dengan
+        tickSize besar). Order seperti itu ditolak bursa, dan di backtest dulu
+        melempar ``ValueError``. Di sini jarak minimal dipaksa satu tick ke arah
+        yang benar (long: SL di bawah, short: SL di atas).
+        """
+        entry_dec = _dec(entry)
+        stop_dec = self.round_price(stop, mode=mode)
+        arah = -1 if side == "long" else 1
+        minimal = entry_dec + self.tick_size * arah
+        if side == "long":
+            return min(stop_dec, minimal)
+        return max(stop_dec, minimal)
+
     def qty_is_valid(self, qty: float | Decimal) -> bool:
         value = _dec(qty)
         if value <= 0:

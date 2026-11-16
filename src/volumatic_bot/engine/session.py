@@ -75,6 +75,10 @@ class SessionReport:
     stop_reason: str | None = None
     incidents: list[dict[str, object]] = field(default_factory=list)
     durasi_sec: float = 0.0
+    #: Jumlah sinyal yang ditahan filter rezim harian (bukan karena risiko).
+    regime_rejected: int = 0
+    #: Catatan tambahan, mis. filter rezim aktif tetapi data harian kurang.
+    notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -88,6 +92,8 @@ class SessionReport:
             "ekuitas": {"awal": self.equity_awal, "akhir": round(self.equity_akhir, 4)},
             "sesi_dihentikan": {"ya": self.stopped, "alasan": self.stop_reason},
             "insiden": self.incidents,
+            "filter_rezim_menahan": self.regime_rejected,
+            "catatan": self.notes,
             "posisi": self.positions,
             "durasi_detik": round(self.durasi_sec, 2),
         }
@@ -116,7 +122,25 @@ async def run_offline_session_async(
     async def _on_signal(signal: Any) -> None:
         await engine.handle_signal(signal)
 
-    feed = KlineFeed(config.indicator.to_params(), max_bars=1700, on_signal=_on_signal)
+    from volumatic_bot.regime import DailyRegimeFilter
+
+    feed = KlineFeed(
+        config.indicator.to_params(),
+        max_bars=1700,
+        on_signal=_on_signal,
+        regime_filter=(
+            DailyRegimeFilter(
+                enabled=True,
+                max_dist_pct=config.regime.max_dist_pct,
+                min_daily_bars=config.regime.min_daily_bars,
+                max_daily_atr_pct=config.regime.max_daily_atr_pct,
+            )
+            if config.regime.enabled
+            else None
+        ),
+        regime_ema_length=config.regime.ema_length,
+        regime_atr_length=config.regime.atr_length,
+    )
     awal = max(warmup_bars, 1)
     feed.seed(
         info.symbol,
@@ -129,6 +153,23 @@ async def run_offline_session_async(
             volume=[float(x) for x in series.volume[:awal]],
         ),
     )
+
+    if feed.regime_filter is not None:
+        # Rezim dibangun dari SELURUH riwayat harian yang sudah tertutup, lalu
+        # dipotong per bar di dalam feed (bukan dari data masa depan).
+        feed.seed_regime_series(info.symbol, series)
+        rezim = feed.regime_for(info.symbol)
+        jumlah_hari = 0 if rezim is None else len(rezim)
+        if jumlah_hari < min(config.regime.min_daily_bars, 2):
+            report.notes.append(
+                "filter rezim harian AKTIF tetapi data tidak cukup untuk EMA200 harian; "
+                "semua sinyal akan ditahan"
+            )
+        else:
+            report.notes.append(
+                f"filter rezim harian aktif: {jumlah_hari} hari (EMA{config.regime.ema_length}), "
+                f"batas {config.regime.max_dist_pct:+.1f}%"
+            )
 
     akhir = len(series) if limit_bars is None else min(len(series), warmup_bars + limit_bars)
     # Metadata simbol wajib tersedia sebelum bar pertama diproses: sinyal pada
@@ -159,6 +200,7 @@ async def run_offline_session_async(
     report.rejected = engine.counters["rejected"]
     report.closed = engine.counters["closed"]
     report.blocked = max(report.blocked, engine.counters["blocked"])
+    report.regime_rejected = feed.regime_rejected
     report.equity_akhir = engine.equity()
     report.stopped = engine.stopped
     report.stop_reason = engine.stop_reason
@@ -202,13 +244,19 @@ def session_report(hasil: dict[str, object]) -> str:
     """Rangkuman teks satu sesi simulasi."""
     ek = hasil["ekuitas"]
     assert isinstance(ek, dict)
+    ditahan = hasil.get("filter_rezim_menahan", 0)
     baris = [
         f"Sesi {hasil['simbol']} selesai: {hasil['bar']} bar, "
         f"{hasil['sinyal']} sinyal, {hasil['posisi_dibuka']} entry, "
-        f"{hasil['posisi_ditutup']} ditutup, {hasil['ditolak_risiko']} ditolak risiko",
+        f"{hasil['posisi_ditutup']} ditutup, {hasil['ditolak_risiko']} ditolak risiko, "
+        f"{ditahan} ditahan filter rezim",
         f"Ekuitas {ek['awal']:.2f} → {ek['akhir']:.2f} USDT ({ek['akhir'] - ek['awal']:+.4f})",
         f"Durasi {hasil['durasi_detik']} detik",
     ]
+    catatan = hasil.get("catatan")
+    if isinstance(catatan, list) and catatan:
+        for isi in catatan:
+            baris.append(f"Catatan: {isi}")
     insiden = hasil["insiden"]
     if isinstance(insiden, list) and insiden:
         baris.append(f"{len(insiden)} insiden tercatat (lihat `positions`)")

@@ -165,7 +165,9 @@ def test_cli_backtest_menghasilkan_ringkasan(tmp_path: Path, capsys: Any) -> Non
             "--equity",
             "50",
             "--rows",
-            "2000",
+            "6000",
+            "--warmup",
+            "120",
             "--risk-pct",
             "0.5",
             "--json",
@@ -174,7 +176,9 @@ def test_cli_backtest_menghasilkan_ringkasan(tmp_path: Path, capsys: Any) -> Non
     )
     out = capsys.readouterr().out
     assert kode == 0, out
-    assert "BTCUSDT 15m" in out
+    # CSV 15m di-resample ke scanner.timeframe (4h) dan dilaporkan sebagai 4h.
+    assert "di-resample ke 4h" in out
+    assert "BTCUSDT 4h" in out
     assert "Sumber funding" in out
     simpan = json.loads((tmp_path / "hasil.json").read_text(encoding="utf-8"))
     assert simpan["statistik"]["trade"] >= 0

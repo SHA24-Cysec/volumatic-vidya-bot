@@ -99,7 +99,7 @@ app:
 #   live     -> order nyata; butuh allow_live: true DAN live_confirmation
 # -----------------------------------------------------------------------------
 ops:
-  mode: "dry_run"
+  mode: "testnet"
   allow_live: false
   # KOSONG dengan sengaja. Untuk mengaktifkan mode live Anda harus mengetik
   # sendiri string berikut (tanpa tanda kutip):
@@ -155,6 +155,29 @@ net:
   kline_pace_sec: 0.05            # jeda kecil antar halaman kline
 
 # -----------------------------------------------------------------------------
+# Deteksi IP egress (IP publik yang dipakai bot menghubungi Binance)
+# -----------------------------------------------------------------------------
+# Kenapa: Binance memutuskan akses dari IP sumber, bukan dari negara akun.
+#   - IP dari lokasi terlarang  -> HTTP 451, bot tidak bisa apa-apa
+#   - IP tidak di whitelist key -> HTTP 403 / kode -2015
+#   - IP melanggar rate limit   -> HTTP 418 (auto-ban sementara)
+# Ketiganya baru ketahuan saat order pertama dikirim. Dengan blok ini, `run`
+# memeriksa lebih dulu dan BERHENTI sebelum order (fail-closed).
+#
+# Cek manual kapan saja:  volumatic-bot ip
+# Rincian: docs/ip-egress.md
+ipcheck:
+  enabled: true
+  sumber:
+    - "https://api.ipify.org"
+    - "https://ifconfig.co/json"
+  timeout_sec: 5
+  cek_saat_menjalankan: true      # periksa otomatis di awal run mode testnet/live
+  wajib_layak: true               # false = tetap jalan walau IP ditolak (TIDAK disarankan)
+  wajib_terbaca: true             # true = IP publik harus terbaca, bukan hanya Binance OK
+  ulang_setiap_menit: 60          # 0 = jangan cek ulang selama sesi berjalan
+
+# -----------------------------------------------------------------------------
 # Indikator (port Volumatic VIDYA)
 # -----------------------------------------------------------------------------
 indicator:
@@ -183,13 +206,19 @@ indicator:
 # Pemindaian multi-simbol
 # -----------------------------------------------------------------------------
 scanner:
-  timeframe: "15m"
+  # Timeframe sinyal. 4h, bukan 15m: backtest 19 simbol 2021-2026 menunjukkan
+  # 15m kehilangan hampir seluruh equity di semua simbol (median -90% per
+  # simbol, avgR -0,20), juga setelah filter rezim. 4h + filter = satu-satunya
+  # kombinasi yang bertahan (avgR +0,07, 10/19 simbol profit).
+  # Catatan: jangan kembali ke 15m tanpa mengulang uji; lihat
+  # docs/tahap-8-filter-rezim.md §8.1.
+  timeframe: "4h"
   max_symbols: 30                   # batas simbol aktif (hemat bandwidth)
   symbol_refresh_hours: 4           # `run` memindai ulang simbol tiap 4 jam (mode otomatis)
   min_quote_volume_24h_usdt: 50000000
   max_spread_pct: 0.05              # 0.05%
-  min_atr_pct: 0.25                 # hindari simbol terlalu mati
-  max_atr_pct: 6.0                  # hindari simbol terlalu liar
+  min_atr_pct: 0.6                  # ATR% 4h: median simbol sehat 1,5-3,5; p05 terendah 0,46
+  max_atr_pct: 12.0                 # ATR% 4h: p95 tertinggi 7,3 (DOGE); 12 hanya menahan ekstrem
   min_price: 0.00001
   quote_asset: "USDT"
   contract_type: "PERPETUAL"
@@ -207,7 +236,10 @@ scanner:
   # Candle warm-up saat start. Studi empiris (docs/studi-warmup.md):
   # 250-400 bar -> tren bisa beda; 500 -> tren sama & VIDYA <2e-5; 1500 -> ATR <0.1%;
   # 2000 -> konvergen penuh (<0.01%). Default 1500 = akurasi tinggi, biaya REST kecil.
-  warmup_bars: 1500
+  warmup_bars: 400                  # 400 bar 4h = 67 hari. Diukur: error ATR turun ke ~3%
+                                    # pada 260 bar dan tidak membaik berarti sampai 1500
+                                    # (docs/studi-warmup.md). 1500 bar 4h = 250 hari,
+                                    # terlalu mahal untuk data uji pendek.
   kline_rest_limit: 1500            # maksimal per request Binance
 
 # -----------------------------------------------------------------------------
@@ -242,6 +274,44 @@ scoring:
   trend_cmo_ref: 50.0               # |CMO| 50 dianggap tren sangat kuat (skor 1.0)
 
 # -----------------------------------------------------------------------------
+# Filter rezim harian (TAMBAHAN, hasil backtest multi-simbol 2021-2026)
+# -----------------------------------------------------------------------------
+# Latar belakang: backtest 19 simbol USDT-M (data.binance.vision, Jan 2021 -
+# Okt 2026, fee 5 bps + slippage 2 bps + funding asli) menunjukkan sinyal
+# indikator ini negatif kalau dipakai apa adanya (15m: -0.12 R/trade,
+# portofolio 8 simbol 2021-2026: -99%). Satu filter yang bertahan uji
+# out-of-sample + uji silang simbol + sensitif terhadap ambangnya:
+#
+#   jarak close ke EMA200 HARIAN, diukur SEARAH trade
+#   dist200_side = (close - EMA200) / EMA200 * 100 * arah (+1 long, -1 short)
+#   entry hanya bila dist200_side <= max_dist_pct
+#
+# Artinya: hanya masuk saat harga sudah terentang >= 8% MELAWAN arah trade
+# terhadap EMA200 harian (short saat harga jauh di atas EMA200, long saat jauh
+# di bawah). Ini filter mean-reversion, bukan konfirmasi tren: sinyal yang
+# searah tren besar justru paling buruk (dist200_side > 0 = -0.07 R/trade).
+#
+# Hasil (portofolio 19 simbol, 4h, exit bawaan config, maks 2 posisi, risiko
+# 1.5%, simulasi scripts/backtest_portofolio.py):
+#   tanpa filter : 734 trade, -19.6%, maxDD 55.4%, PF 0.97
+#   filter -8%   : 410 trade, +102.9%, CAGR +13.3%, maxDD 31.3%, PF 1.20
+#   ambang -5 s/d -15 semuanya positif (fleksibel, bukan paku satu angka)
+#
+# PENTING: 15m tetap NEGATIF walau difilter (-99% s/d -57% di uji yang sama)
+# karena biaya 14 bps bolak-balik makan seluruh edge. Pakai timeframe >= 4h.
+# Rincian: docs/tahap-8-filter-rezim.md
+# -----------------------------------------------------------------------------
+regime:
+  enabled: true                     # false = perilaku lama (sinyal mentah)
+  ema_length: 200                   # EMA harian
+  atr_length: 14                    # ATR harian, hanya untuk batas kewajaran
+  max_dist_pct: -8.0                # batas dist200_side (persen); -8 = terentang 8% melawan arah
+  min_daily_bars: 200               # data harian minimum sebelum filter boleh meloloskan entry
+  max_daily_atr_pct: 25.0           # tolak entry bila ATR harian di atas ini (pasar terlalu liar)
+  daily_kline_limit: 320            # candle harian yang diunduh (warm-up + refresh)
+  refresh_minutes: 60               # segarkan candle harian tiap 60 menit (hemat bandwidth)
+
+# -----------------------------------------------------------------------------
 # Risiko (ramah modal < 50 USD)
 # -----------------------------------------------------------------------------
 risk:
@@ -274,6 +344,10 @@ risk:
 # Manajemen trade: entry, SL, TP, break-even, trailing
 # -----------------------------------------------------------------------------
 trade:
+  # Exit TIDAK diubah saat pindah ke 4h: uji 19 simbol menunjukkan exit bawaan
+  # (partial 50% di 1,5R, BE 1R, trailing 2 ATR) justru LEBIH BAIK di 4h
+  # (+5,3% rata-rata/simbol) daripada SL 2ATR + TP 2R tanpa partial (+2,7%).
+  # Jadi SL/TP dibiarkan apa adanya; yang menentukan adalah timeframe + filter.
   entry_mode: "limit_fallback"      # market | limit_fallback
   entry_limit_timeout_sec: 5        # batalkan bila tidak terisi
   entry_limit_offset_ticks: 0       # 0 = pas best bid/ask
@@ -323,7 +397,10 @@ data:
 dashboard:
   enabled: true
   refresh_sec: 1.5                    # detik antar-refresh; makin besar makin hemat CPU
-  max_log_lines: 12                   # ekor log di panel kejadian
+  max_log_lines: 10                   # ekor log di panel kejadian
+  log_ulang_jendela_menit: 90         # pesan sama digabung jadi "(xN)" walau disela
+                                      # pesan lain, asalkan jaraknya <= 90 menit;
+                                      # 0 = hanya pesan yang benar-benar berurutan
   max_signals_shown: 10               # baris kandidat yang ditampilkan
   compact: false                      # true = satu panel ringkas
   layar_penuh: true                   # layar penuh saat live: kebal resize, frame tak menumpuk

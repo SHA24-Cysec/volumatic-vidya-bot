@@ -17,7 +17,13 @@ lalu mengelola **maksimal satu posisi per simbol** dengan TP, SL, break-even
 > yang merakit semua komponen, **backtester dengan model biaya lengkap**
 > (fee + slippage + funding historis), serta **audit keamanan** berupa 15 invarian
 > yang dijaga test.
-> **Hasil backtest-nya NEGATIF setelah biaya** — lihat [bagian TAHAP 7](#mesin-trading--backtester-tahap-7).
+> **Timeframe bawaan sekarang 4h.** Di 15m (bawaan repo sebelumnya) backtest
+> selalu negatif setelah biaya (-91% s/d -96% per simbol, juga setelah filter).
+> TAHAP 8 menambah **filter entry rezim harian** dan memindah default ke **4h**:
+> hasil portofolio +102,9% / CAGR +13,3% pada 19 simbol 2021-2026, dengan
+> drawdown 31%. Angka per simbol jauh lebih sederhana: rata-rata +5,3%, median
+> +1,3%, 10 dari 19 simbol profit. Filter bukan obat untuk semua timeframe —
+> lihat [`docs/tahap-8-filter-rezim.md`](docs/tahap-8-filter-rezim.md).
 > Perintah `simulate-session`/`backtest` **tidak** mengirim order ke bursa; jalur
 > `testnet`/`live` sudah ditulis tetapi **belum pernah dijalankan ke Binance**
 > (sandbox pengembangan diblokir HTTP 451 — lihat bagian keterbatasan).
@@ -26,11 +32,17 @@ lalu mengelola **maksimal satu posisi per simbol** dengan TP, SL, break-even
 
 - Proyek ini **tidak menjanjikan profit**. Indikator tren apa pun bisa salah,
   dan futures dengan leverage bisa menghabiskan modal Anda.
-- **Backtest sudah dijalankan dan hasilnya negatif.** BTCUSDT 15m, 14.688 bar
-  (Juli–November 2025), fee 5 bps + slippage 2 bps: −9,40% pada skenario
-  leverage 10x, dan **0 trade** dengan pagar bawaan untuk modal 50 USDT. Rincian
-  dan tabel sensitivitas ada di
+- **Backtest bawaan (15m) negatif.** BTCUSDT 15m, 14.688 bar (Juli–November
+  2025), fee 5 bps + slippage 2 bps: −9,40% pada skenario leverage 10x, dan
+  **0 trade** dengan pagar bawaan untuk modal 50 USDT. Diperluas ke 19 simbol
+  2021-2026: portofolio 15m **−99,3%**; 1h −79,2%; 4h −13,6%. Rincian TAHAP 7:
   [`docs/tahap-7-mesin-backtest.md`](docs/tahap-7-mesin-backtest.md).
+- **TAHAP 8: filter entry rezim harian.** Sinyal hanya diterima bila harga sudah
+  terentang >= 8% melawan arah trade terhadap EMA200 harian. Pada **4h**, 19
+  simbol 2021-2026: **+102,9%** (CAGR +13,3%, maxDD 31,3%, PF 1,20, 410 trade)
+  vs **−19,6%** tanpa filter. Ketiga subperiode 2 tahun positif. Pada **15m
+  tetap negatif** (−16,7% vs −33,6% pada data 5 bulan repo). Detail, semua tabel,
+  dan daftar keterbatasan: [`docs/tahap-8-filter-rezim.md`](docs/tahap-8-filter-rezim.md).
 - Seluruh pengujian berjalan **offline** di sandbox: indikator diuji terhadap
   data kline asli Binance (data.binance.vision) + implementasi referensi
   independen; lapisan REST/WebSocket diuji terhadap **server lokal** (bukan mock).
@@ -301,6 +313,72 @@ yang menemukan empat bug akuntansi (qty `closePosition` bertanda, `realized_pnl`
 selalu 0, deteksi penutupan memakai state basi, urutan SL/TP tidak deterministik);
 semuanya sudah diperbaiki dan dijaga test.
 
+### Deteksi IP egress
+
+Sebelum `run` mengirim order, bot memeriksa IP publiknya sendiri dan menguji
+apakah Binance menerimanya (ping + server time). Bila IP ditolak (HTTP 451
+lokasi terlarang, 403 whitelist, atau 418 auto-ban), sesi **tidak dimulai**
+(exit code 3) alih-alih gagal di tengah jalan setelah posisi dibuka.
+
+```bash
+volumatic-bot ip                 # IP publik + status di Binance
+volumatic-bot ip --tanpa-binance # hanya baca IP
+```
+
+Selama sesi berjalan, IP diperiksa ulang tiap `ipcheck.ulang_setiap_menit`
+menit; bila berubah jadi ditolak, bot berhenti membuka posisi baru tanpa
+menutup posisi yang sudah ada (SL di bursa tetap berlaku).
+
+Panel KEJADIAN merangkum log: pesan berulang digabung menjadi satu baris
+berpenanda `(xN)` (dengan jam kemunculan terakhir), dan daftar simbol pada
+`refresh simbol` diringkas menjadi jumlah masuk/keluar. Atur lewat
+`dashboard.log_ulang_jendela_menit` (bawaan 90 menit, `0` = hanya pesan yang
+benar-benar berurutan).
+
+Hasilnya tampil di dashboard pada panel STATUS BOT (`IP egress  34.19.24.63 (SG)
+· Binance OK`), hanya bila ada datanya. Dashboard membaca catatan dari SQLite,
+jadi tidak membuka koneksi tambahan. Rincian dan batasnya:
+[`docs/ip-egress.md`](docs/ip-egress.md).
+
+### Filter entry rezim harian (TAHAP 8)
+
+`regime:` di `config.yaml` (bawaan **aktif**) menambah satu syarat entry:
+
+```
+dist200_side = (close - EMA200_harian) / EMA200_harian * 100 * arah
+entry hanya bila dist200_side <= regime.max_dist_pct      (bawaan -8.0)
+```
+
+EMA200 dihitung dari candle **harian yang sudah selesai** sebelum hari sinyal
+(tidak ada look-ahead, dijaga test). Ini filter *mean-reversion*: sinyal VIDYA
+yang searah tren besar justru punya expectancy terburuk (−0,07 R), sedangkan
+sinyal saat harga terentang melawan tren menghasilkan +0,14 R.
+
+| 19 simbol, 4h, 2021-2026, risiko 1,5%, maks 2 posisi | Trade | Return | CAGR | MaxDD | PF |
+|---|---|---|---|---|---|
+| tanpa filter | 734 | −19,6% | −3,7% | 55,4% | 0,97 |
+| **filter rezim −8%** | 410 | **+102,9%** | **+13,3%** | 31,3% | 1,20 |
+| filter −5% / −10% / −15% | 443 / 389 / 346 | +51,4% / +88,3% / +86,2% | +7,6% / +11,8% / +11,6% | 40,5% / 27,8% / 24,7% | 1,11 / 1,19 / 1,21 |
+
+Per subperiode (modal direset): 2021-2022 **+13,7%**, 2023-2024 **+14,6%**,
+2025-Okt 2026 **+55,7%**.
+
+Yang **tidak** berubah: di **15m** strategi tetap rugi (−16,7% vs −33,6% pada
+data 5 bulan repo) karena fee+slippage ±14 bps bolak-balik memakan seluruh edge.
+Karena itu timeframe 4h yang masuk akal untuk bot ini, dan `trade.*` (SL/TP
+berbasis ATR) harus disesuaikan bila Anda pindah timeframe.
+
+Verifikasi ulang (butuh `scripts/unduh_data_uji.py` + `scripts/unduh_funding.py`):
+
+```bash
+python scripts/backtest_portofolio.py --data-dir data/raw --tf 4h \
+    --max-pos 2 --risk-pct 1.5 --dist200-max -8 --no-flip
+```
+
+Bug yang ikut diperbaiki: `trade.exit_on_trend_flip` sebelumnya **tidak pernah
+dieksekusi** (tidak ada kode yang membaca nilainya). Sekarang posisi ditutup saat
+tren VIDYA berbalik, dan perilakunya dijaga test.
+
 ### Backtester
 
 Model biaya **lengkap dan terpisah**: fee taker 5 bps/sisi, slippage 2 bps/sisi
@@ -394,18 +472,43 @@ tertunda), serta library yang belum mendukung 3.14.
     (`var/bot-dry-run.db`, `var/bot-testnet.db`, `var/bot-live.db`), sedangkan
     cache candle dipakai bersama (`var/cache.db`). Lihat
     [`docs/cara-menjalankan.md`](docs/cara-menjalankan.md) §4c.
-22. **Proteksi diuji ulang setelah insiden testnet 15 Nov 2026**: SL tidak lagi
+23. **Filter rezim (TAHAP 8) hanya terbukti di 4h.** Di 15m/1h strategi tetap
+    rugi setelah biaya, dengan atau tanpa filter. Filter dipilih dari data
+    historis 2021-2026 yang sama dengan data uji; walk-forward dan uji silang
+    simbol lulus, tetapi **tidak ada jaminan edge bertahan** setelah 2026.
+    Satu tahun merah tetap mungkin (drawdown 31% pada risiko 1,5% adalah
+    kejadian nyata).
+24. **Pergantian timeframe mengubah segalanya.** `trade.sl_atr_mult`, `tp1_r`,
+    BE, dan trailing memakai ATR timeframe aktif. Pindah dari 15m ke 4h membuat
+    jarak SL ~4x lebih lebar, sehingga qty otomatis mengecil (risiko USDT sama)
+    dan notional bisa jatuh di bawah `minNotional` untuk modal kecil.
+25. **Proteksi diuji ulang setelah insiden testnet 15 Nov 2026**: SL tidak lagi
     dikirim bila harga sudah melewati stop (`-2021`), ada varian SL cadangan
     (`reduceOnly`), `-2022` tidak dianggap gagal, dan posisi yang gagal
     dilindungi **sekaligus** gagal ditutup akan menghentikan sesi
     (`naked_position`). Pesan insiden kini memuat kode bursa + parameter order.
     Tetap: uji testnet sebelum uang sungguhan.
-23. **Kill switch kini reaktif (±3 detik)** — sebelumnya hanya diperiksa saat ada
+26. **Kill switch kini reaktif (±3 detik)** — sebelumnya hanya diperiksa saat ada
     sinyal, sehingga `touch KILL_SWITCH` pada bot yang berjalan nyaris tidak
     berefek. Ctrl+C / kill proses **tidak** menutup posisi (SL tetap aktif di
     bursa); gunakan `kill-switch` bila ingin keluar semua.
-24. **Target TP/SL belum dipetakan sensitivitasnya** — semua trade pada skenario
-    10x keluar di SL/BE, jadi TP1/TP2 adalah kandidat utama untuk diselidiki.
+27. **Timeframe bawaan sekarang 4h, bukan 15m.** 15m merugi di semua simbol
+    (median -90% per simbol, juga setelah filter), jadi default-nya dipindah.
+    Konsekuensinya: CSV 15m yang Anda berikan ke `backtest` akan digabung ke 4h
+    lebih dulu (dengan pesan eksplisit), dan berkas 1h/1d ditolak karena tidak
+    bisa dipecah. Angka pendukungnya di
+    [`docs/tahap-8-filter-rezim.md`](docs/tahap-8-filter-rezim.md) §8.1.
+29. **Deteksi IP memakai layanan pihak ketiga** (ipify, ifconfig.co) untuk
+    membaca IP publik. Tidak ada data akun yang dikirim, hanya permintaan HTTP
+    biasa, tetapi itu tetap koneksi keluar tambahan: setel `ipcheck.enabled:
+    false` bila tidak diinginkan. Klasifikasi geo layanan itu bisa berbeda dari
+    klasifikasi Binance, jadi yang dipakai sebagai keputusan adalah hasil uji
+    langsung ke Binance.
+30. **SL bisa jatuh tepat di harga entry** bila ATR lebih kecil dari satu tick
+    (TRXUSDT, ARBUSDT di 4h). Dulu melempar `ValueError`; kini
+    `SymbolFilters.stop_outside_entry()` memaksa jarak minimal satu tick.
+    Test regresi: `tests/test_risk_plan.py`. Pesanan dengan SL = entry tetap
+    akan ditolak bursa, jadi jangan memakai pola `round_price(stop_raw)` polos.
 
 ## Struktur proyek
 

@@ -205,3 +205,39 @@ def test_summary_berisi_level_penting() -> None:
     for kata in ("BELI", "entry=", "SL=", "TP1=", "BE=", "trail_aktif="):
         assert kata in teks
     assert "JUAL" in plan(side="short", trail=103.0).summary()
+
+
+# ------------------------------------------- SL lebih kecil dari satu tick
+def test_sl_tidak_menempel_di_entry_bila_tick_lebih_besar_dari_jarak_sl():
+    """Regresi: ATR sangat kecil + tickSize besar membuat SL == entry.
+
+    Ditemukan saat backtest 4h TRXUSDT/ARBUSDT: ``round_price`` menghasilkan SL
+    sama dengan harga entry, lalu simulator melempar "SL tidak boleh sama dengan
+    harga entry". Order seperti itu juga pasti ditolak bursa.
+    """
+    f = filters(tick="0.000010")  # TRXUSDT
+    hasil = plan(
+        entry_price=0.101234,
+        atr=0.000001,  # ATR 0.000001, tick 0.00001 -> jarak SL < 1 tick
+        trail=0.09,
+        filters=f,
+        trade=TradeConfig(sl_mode="atr", sl_atr_mult=2.0, sl_min_atr_mult=2.0),
+    )
+    assert hasil.risk_per_unit > 0
+    assert hasil.stop_price < hasil.entry_price
+    assert hasil.entry_price - hasil.stop_price >= f.tick_size
+
+
+def test_sl_short_tidak_menempel_di_entry_bila_tick_lebih_besar_dari_jarak_sl():
+    f = filters(tick="0.000010")
+    hasil = plan(
+        side="short",
+        entry_price=0.101234,
+        atr=0.000001,
+        trail=0.11,
+        filters=f,
+        trade=TradeConfig(sl_mode="atr", sl_atr_mult=2.0, sl_min_atr_mult=2.0),
+    )
+    assert hasil.risk_per_unit > 0
+    assert hasil.stop_price > hasil.entry_price
+    assert hasil.stop_price - hasil.entry_price >= f.tick_size

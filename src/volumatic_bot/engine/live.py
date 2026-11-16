@@ -90,6 +90,8 @@ class LiveSession:
     auto: bool = False
     scanner: Any = None
     cache: KlineCache | None = None
+    #: Waktu monotonic berikutnya candle harian (filter rezim) disegarkan.
+    _rezim_berikut: float = 0.0
 
     async def close(self) -> None:
         if self.cache is not None:
@@ -167,6 +169,7 @@ async def build_session(
     config_path: str | Path | None = None,
     profil: str | None = None,
     saldo_awal: float | None = None,
+    laporan_ip: Any = None,
 ) -> LiveSession:
     """Susun semua komponen sesi dari konfigurasi (tanpa membuka koneksi WS).
 
@@ -351,7 +354,25 @@ async def build_session(
         )
 
         # --- feed sinyal -----------------------------------------------------
-        feed = KlineFeed(config.indicator.to_params(), max_bars=1700)
+        from volumatic_bot.regime import DailyRegimeFilter
+
+        saring_rezim = (
+            DailyRegimeFilter(
+                enabled=True,
+                max_dist_pct=config.regime.max_dist_pct,
+                min_daily_bars=config.regime.min_daily_bars,
+                max_daily_atr_pct=config.regime.max_daily_atr_pct,
+            )
+            if config.regime.enabled
+            else None
+        )
+        feed = KlineFeed(
+            config.indicator.to_params(),
+            max_bars=1700,
+            regime_filter=saring_rezim,
+            regime_ema_length=config.regime.ema_length,
+            regime_atr_length=config.regime.atr_length,
+        )
         await _warmup(rest, feed, daftar, config)
         # Warm-up (1500 candle + exchangeInfo) adalah biaya sekali. Buang dari
         # jendela bandwidth supaya dashboard tidak melaporkan "72 MB/jam" hanya
@@ -370,6 +391,8 @@ async def build_session(
             reset_hour_local=config.risk.daily_loss_reset_hour_local,
         )
         dashboard.daily_state = harian
+        if laporan_ip is not None:
+            _catat_ip_ke_dashboard(dashboard, laporan_ip)
 
         engine = TradingEngine(
             config,
@@ -475,6 +498,20 @@ async def _warmup(
         feed.seed(symbol, _series_dari_klines(rows))
         await asyncio.sleep(config.net.kline_pace_sec)
 
+    if feed.regime_filter is None:
+        return
+    limit = config.regime.daily_kline_limit
+    for symbol in symbols:
+        try:
+            harian = await rest.klines(symbol, interval="1d", limit=limit)
+        except Exception as exc:
+            logger.warning(
+                "warm-up harian %s gagal (filter rezim menolak simbol ini): %s", symbol, exc
+            )
+            continue
+        feed.seed_regime(symbol, _series_dari_klines(harian))
+        await asyncio.sleep(config.net.kline_pace_sec)
+
 
 def _kline_ke_mesin(sesi: LiveSession) -> Any:
     """Bungkus ``feed.handle_event`` agar sesuai tipe yang diharapkan stream."""
@@ -510,13 +547,23 @@ async def run_live_session(
     dashboard: bool = True,
     config_path: str | Path | None = None,
     profil: str | None = None,
+    laporan_ip: Any = None,
 ) -> int:
     """Jalankan sesi sampai dihentikan (Ctrl+C / kill switch / batas harian).
 
     Mengembalikan kode keluar: 0 normal, 2 bila sesi diblokir sebelum mulai.
+
+    ``laporan_ip`` (opsional) adalah hasil pemeriksaan IP yang sudah dilakukan
+    pemanggil, mis. sebelum sesi dimulai. Dipakai mengisi panel STATUS BOT tanpa
+    menembak layanan IP dua kali.
     """
     sesi = await build_session(
-        config, secrets, symbols=symbols, config_path=config_path, profil=profil
+        config,
+        secrets,
+        symbols=symbols,
+        config_path=config_path,
+        profil=profil,
+        laporan_ip=laporan_ip,
     )
     # Catat PID: supaya `volumatic-bot stop` bisa menemukan proses ini, dan supaya
     # tidak ada dua bot yang jalan bersamaan pada database/mode yang sama.
@@ -573,6 +620,7 @@ async def run_live_session(
         _state,
         refresh_sec=config.dashboard.refresh_sec,
         screen=config.dashboard.layar_penuh,
+        jendela_menit=config.dashboard.log_ulang_jendela_menit,
     )
     tugas = [
         asyncio.create_task(user_stream.run(), name="user-stream"),
@@ -601,13 +649,25 @@ async def run_live_session(
             if await engine.check_kill_switch():
                 return
 
+    berikut_ip = (
+        time.monotonic() + config.ipcheck.ulang_setiap_menit * 60.0
+        if config.ipcheck.enabled and config.ipcheck.ulang_setiap_menit > 0
+        else float("inf")
+    )
+
     try:
         while not engine.stopped:
             await _tidur_sambil_cek(config.ops.reconcile_interval_sec)
             if bool(engine.stopped):
                 break
+            if time.monotonic() >= berikut_ip:
+                berikut_ip = time.monotonic() + config.ipcheck.ulang_setiap_menit * 60.0
+                await _periksa_ip_berkala(config, sesi, engine)
+                if bool(engine.stopped):
+                    break
             await engine.periodic()
             await _tick_harga(sesi)
+            await _segarkan_rezim(sesi, config)
             save_daily_state(sesi.store, harian, _now_zona(config)())
 
             # --- refresh daftar simbol (mode otomatis) -----------------------
@@ -635,6 +695,75 @@ async def run_live_session(
         with contextlib.suppress(OSError):
             await asyncio.to_thread(jalur_pid.unlink)
     return 0
+
+
+def _catat_ip_ke_dashboard(sumber: Any, laporan: Any) -> None:
+    """Teruskan hasil pemeriksaan IP ke panel STATUS BOT (tanpa I/O tambahan).
+
+    ``sumber`` boleh :class:`LiveSession` atau :class:`LocalStateSource`; yang
+    dipakai hanya atribut ``dashboard``/``set_ip`` (dan ``store`` untuk
+    menyimpan ke SQLite).
+    """
+    from contextlib import suppress
+    from datetime import datetime
+
+    panel = getattr(sumber, "dashboard", sumber)
+    panel.set_ip(
+        laporan.ip,
+        negara=laporan.negara,
+        binance=laporan.binance,
+        diperiksa=datetime.now().astimezone().isoformat(timespec="seconds"),
+    )
+    # Simpan juga ke SQLite: `volumatic-bot dashboard` adalah proses terpisah
+    # yang hanya membaca database, jadi tanpa ini baris IP tidak muncul di sana.
+    store = getattr(sumber, "store", None)
+    if store is not None:
+        with suppress(Exception):
+            store.set_state(
+                "ip_egress",
+                f"{laporan.ip}|{laporan.negara}|"
+                f"{'' if laporan.binance is None else (1 if laporan.binance else 0)}|"
+                f"{datetime.now().astimezone().isoformat(timespec='seconds')}",
+            )
+
+
+async def _periksa_ip_berkala(config: AppConfig, sesi: LiveSession, engine: Any) -> None:
+    """Cek ulang IP di tengah sesi; hentikan bot bila Binance mulai menolaknya.
+
+    IP dinamis (VPS dengan floating IP, koneksi rumahan, container yang
+    dijadwalkan ulang) bisa berubah tanpa bot restart. Kalau IP baru tidak
+    dilayani Binance, order berikutnya akan gagal dan SL bisa tidak terpasang:
+    itu risiko yang terlalu mahal untuk dibiarkan sampai kebetulan terlihat.
+    """
+    from volumatic_bot.net.ipcheck import ambil_ip_publik, periksa_binance, sumber_dari_url
+
+    sumber = tuple(sumber_dari_url(u) for u in config.ipcheck.sumber)
+    laporan = await ambil_ip_publik(sumber, timeout_sec=config.ipcheck.timeout_sec)
+    await periksa_binance(laporan, rest=sesi.api.rest)
+    _catat_ip_ke_dashboard(sesi, laporan)
+    kunci = f"{laporan.ip}|{laporan.binance}"
+    sebelumnya = str(sesi.info.get("ip_kunci", ""))
+    sesi.info["ip_kunci"] = kunci
+    if laporan.binance:
+        # Hanya dicatat saat berubah: pesan "masih diterima" tiap 60 menit
+        # memenuhi panel KEJADIAN tanpa menambah informasi apa pun. Status
+        # terkini sudah terlihat di panel STATUS BOT.
+        if kunci != sebelumnya:
+            logger.info("ipcheck: %s diterima Binance", laporan.ip or "(tak terbaca)")
+        else:
+            logger.debug(
+                "ipcheck berkala: %s masih diterima Binance", laporan.ip or "(tak terbaca)"
+            )
+        return
+    pesan = (
+        f"IP {laporan.ip or '(tak terbaca)'} tidak lagi diterima Binance "
+        f"({laporan.binance_pesan or 'tanpa pesan'})"
+    )
+    logger.error("ipcheck berkala: %s", pesan)
+    # Sengaja TIDAK menutup posisi: kalau IP diblokir, order penutup juga akan
+    # ditolak dan justru meninggalkan posisi tanpa pelindung. SL yang sudah
+    # terpasang di bursa tetap berlaku; yang dihentikan hanya pembukaan baru.
+    engine.stop_session(f"{pesan} (posisi dibiarkan dengan SL yang sudah terpasang)")
 
 
 async def _refresh_simbol(
@@ -687,6 +816,30 @@ async def _refresh_simbol(
     if klien_lama is not None:
         klien_lama.stop()
     return buat_klien(gabungan)  # type: ignore[no-any-return]
+
+
+async def _segarkan_rezim(sesi: LiveSession, config: AppConfig) -> None:
+    """Segarkan candle harian untuk filter rezim (hemat: tiap 6 jam).
+
+    Tanpa ini, EMA200 harian tidak pernah bergerak setelah warm-up dan filter
+    perlahan menjadi basi (paling lambat 1 hari saat pasar bergerak).
+    """
+    if sesi.feed.regime_filter is None:
+        return
+    sekarang = time.monotonic()
+    if sekarang < getattr(sesi, "_rezim_berikut", 0.0):
+        return
+    sesi._rezim_berikut = sekarang + config.regime.refresh_minutes * 60.0
+    for simbol in sesi.feed.symbols:
+        try:
+            harian = await sesi.rest.klines(
+                simbol, interval="1d", limit=config.regime.daily_kline_limit
+            )
+        except Exception as exc:
+            logger.warning("segarkan rezim %s gagal: %s", simbol, exc)
+            continue
+        sesi.feed.seed_regime(simbol, _series_dari_klines(harian))
+        await asyncio.sleep(config.net.kline_pace_sec)
 
 
 async def _tick_harga(sesi: LiveSession) -> None:

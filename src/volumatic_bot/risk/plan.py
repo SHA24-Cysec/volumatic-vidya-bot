@@ -139,13 +139,14 @@ def build_trade_plan(
         )
         stop_raw = float(entry) - sign * min_distance
         source = f"{source}+min_atr"
-    stop_price = to_price(stop_raw)
+    stop_price = filters.stop_outside_entry(
+        entry, to_price(stop_raw), side=side, mode="down" if side == "long" else "up"
+    )
     risk_per_unit = abs(entry - stop_price)
-    if risk_per_unit <= 0:
-        # Bisa terjadi bila tickSize lebih besar dari jarak SL; paksa 1 tick.
-        risk_per_unit = filters.tick_size if filters.tick_size > 0 else Decimal("0.00000001")
-        stop_price = entry - sign * risk_per_unit
-        notes.append("jarak SL lebih kecil dari 1 tick; dinaikkan ke 1 tick")
+    if risk_per_unit <= 0:  # pragma: no cover - dijaga stop_outside_entry
+        tick = filters.tick_size if filters.tick_size > 0 else Decimal("0.00000001")
+        risk_per_unit = tick
+        stop_price = entry - sign * tick
 
     # ---- TP1 --------------------------------------------------------------
     tp1_raw = float(entry) + sign * trade.tp1_r * float(risk_per_unit)

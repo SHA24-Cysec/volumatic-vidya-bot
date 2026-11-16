@@ -76,6 +76,13 @@ volumatic-bot --config config.yaml preflight --equity 50
 # 1c. lihat sinyal indikator pada data historis
 volumatic-bot indicator --candles tests/data/btcusdt_15m_5bulan.csv.gz --show 5
 
+# Catatan: config bawaan sekarang 4h. Berkas CSV 15m di bawah otomatis
+# digabung ke 4h (muncul pesan "data 15m di-resample ke 4h") supaya label,
+# ATR, dan SL sesuai timeframe yang benar-benar dipakai bot.
+# Berkas uji 5 bulan itu hanya berisi 152 hari, sedangkan filter rezim butuh
+# 200 hari harian: hasilnya "0 entry, N ditahan filter rezim" dan itu wajar.
+# Untuk sesi yang benar-benar entry, pakai data >= 8 bulan (mis. data/raw/).
+
 # 1d. mesin produksi diputar pada candle historis (menulis ke SQLite)
 volumatic-bot --config config.yaml simulate-session \
     --candles tests/data/btcusdt_15m_5bulan.csv.gz --symbol BTCUSDT \
@@ -135,7 +142,15 @@ menerjemahkan error menjadi saran tindakan:
 
 ```bash
 volumatic-bot --config config.yaml netcheck
+
+# khusus IP: alamat publik yang dipakai bot + apakah Binance menerimanya
+volumatic-bot ip
 ```
+
+Sejak fitur deteksi IP ditambahkan, `netcheck` mencetak IP publik di bagian
+atas. Bila yang Anda butuhkan hanya itu, perintah `ip` lebih singkat dan
+langsung memberi kesimpulan LAYAK / TIDAK LAYAK dengan exit code. Rinciannya di
+[`ip-egress.md`](ip-egress.md).
 
 Contoh keluaran bila Binance memblokir lokasi Anda (kasus paling sering di
 Indonesia):
@@ -179,7 +194,7 @@ permintaan gagal.
 
 Catatan penting: **sinyal tidak "dicari" ke seluruh pasar setiap detik.** Bot
 hanya memantau simbol yang lolos filter dan sudah dihangatkan; sinyal VIDYA
-muncul saat candle 15m tertutup. Jadi "deteksi otomatis" = daftar simbol otomatis,
+muncul saat candle timeframe `scanner.timeframe` (bawaan 4h) tertutup. Jadi "deteksi otomatis" = daftar simbol otomatis,
 bukan pemindaian ulang indikator untuk 528 simbol tiap menit (itu akan boros
 bandwidth dan bobot REST).
 
@@ -243,7 +258,7 @@ dikirim sampai ada sinyal yang lolos semua pagar. Contoh yang normal:
 | Yang tampil | Arti |
 |---|---|
 | `Ekuitas 5000.00 USDT` | saldo **testnet** Anda (bukan modal nyata) — angka ini hanya bisa muncul kalau API key + signature Anda **valid**, jadi kunci sudah benar |
-| `Posisi 0/2`, `Trade 0/20` | belum ada trade; wajar. Sinyal VIDYA pada 15m jarang (data uji 5 bulan ≈ 15 sinyal untuk BTCUSDT = ±1 sinyal/10 hari per simbol) |
+| `Posisi 0/2`, `Trade 0/20` | belum ada trade; wajar. Di 4h sinyal jauh lebih jarang: perubahan tren VIDYA ±2 kali per bulan per simbol, dan sebagian ditolak filter rezim |
 | `KANDIDAT — belum ada kandidat` | diisi hanya saat bot memindai simbol sendiri (`scan`/`listen`); `run --symbols X` tidak memakai pemindai |
 | `POSISI (0 aktif, 1 riwayat)` + baris `selesai:SL` | **riwayat** posisi lama dari database yang sama (`var/bot.db`), bukan posisi terbuka. Baris riwayat kini diredupkan dan diberi label `selesai:` |
 | `Bandwidth 72 MB/jam` (menit pertama) | dulu melaporkan burst warm-up (1500 candle + exchangeInfo). Sekarang jendela direset setelah warm-up, jadi angkanya mencerminkan kondisi tunak |

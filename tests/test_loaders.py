@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from volumatic_bot.data.loaders import candles_to_frame, load_candles_csv
+from volumatic_bot.data.loaders import candles_to_frame, load_candles_csv, resample_candles
 from volumatic_bot.models import CandleSeries
 
 
@@ -78,3 +78,36 @@ def test_candle_series_menolak_waktu_tidak_urut() -> None:
 def test_candle_series_menolak_panjang_beda() -> None:
     with pytest.raises(ValueError, match="tidak konsisten"):
         CandleSeries.from_columns([1, 2], [1], [1, 1], [1, 1], [1, 1], [1, 1])
+
+
+def _seri_15m(n: int = 32):
+    from volumatic_bot.models import CandleSeries
+
+    awal = 1_700_000_000_000 - (1_700_000_000_000 % 14_400_000)
+    waktu = [awal + i * 900_000 for i in range(n)]
+    harga = [100.0 + i for i in range(n)]
+    return CandleSeries.from_columns(
+        open_time=waktu, open=harga, high=[h + 1 for h in harga],
+        low=[h - 1 for h in harga], close=harga, volume=[10.0] * n,
+    )
+
+
+def test_resample_15m_ke_4h_menggabungkan_16_bar() -> None:
+    seri = _seri_15m(32)
+    hasil = resample_candles(seri, "4h")
+    assert len(hasil) == 2
+    assert hasil.open[0] == seri.open[0]
+    assert hasil.high[0] == max(seri.high[:16])
+    assert hasil.low[1] == min(seri.low[16:32])
+    assert hasil.close[1] == seri.close[-1]
+    assert hasil.volume[0] == sum(seri.volume[:16])
+
+
+def test_resample_membuang_ember_setengah_jadi_di_ujung() -> None:
+    hasil = resample_candles(_seri_15m(20), "4h")
+    assert len(hasil) == 1
+
+
+def test_resample_menolak_data_yang_lebih_besar_dari_target() -> None:
+    with pytest.raises(ValueError, match="tidak bisa di-resample"):
+        resample_candles(_seri_15m(32), "5m")
